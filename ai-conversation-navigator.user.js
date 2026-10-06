@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI Conversation Navigator
 // @namespace    http://tampermonkey.net/
-// @version      12.10
+// @version      12.11
 // @description  Orbital navigation interface for AI chat platforms — Claude, ChatGPT, Grok, Gemini, Bolt, Lovable, Replit, V0, Base44, Emergent, Perplexity, and Firebase Studio
 // @updateURL    https://raw.githubusercontent.com/epodak/ai-conversation-navigator/main/ai-conversation-navigator.user.js
 // @downloadURL  https://raw.githubusercontent.com/epodak/ai-conversation-navigator/main/ai-conversation-navigator.user.js
@@ -42,7 +42,7 @@
     // ============================================================
     // VERSION
     // ============================================================
-    var ACN_VERSION = '12.10';
+    var ACN_VERSION = '12.11';
 
     // ============================================================
     // i18n — internationalization string table
@@ -5149,12 +5149,40 @@
             }
             rail.style.pointerEvents = 'auto';
 
-            // Scale gracefully from short chats to 100+ turn research threads.
-            var maxH = Math.min(window.innerHeight * 0.56, 420);
-            var targetH = Math.min(maxH, Math.max(34, count * (count > 120 ? 2.2 : count > 60 ? 3.2 : 5.6)));
-            rail.style.height = Math.round(targetH) + 'px';
-            rail.style.setProperty('--acn-mini-gap',
-                count > 140 ? '0px' : count > 80 ? '1px' : count > 36 ? '1.5px' : '3px');
+            // Mouse acquisition matters more than packing density. The old rail used
+            // ~2px-tall buttons with ~3px gaps, which looked tidy but was effectively
+            // unclickable. For ordinary chats we spread prompt centers roughly 5x
+            // farther apart while keeping the visible dash itself only 2px thick.
+            //
+            // Very long threads progressively compress so the rail stays within the
+            // viewport; the hit target remains much larger than the visible stroke.
+            var gapPx, hitPx;
+            if (count <= 18) {
+                gapPx = 15; hitPx = 14;
+            } else if (count <= 36) {
+                gapPx = 9; hitPx = 12;
+            } else if (count <= 80) {
+                gapPx = 5; hitPx = 9;
+            } else if (count <= 140) {
+                gapPx = 3; hitPx = 7;
+            } else {
+                gapPx = 1; hitPx = 5;
+            }
+            rail.style.height = 'auto';
+            rail.style.setProperty('--acn-mini-gap', gapPx + 'px');
+            rail.style.setProperty('--acn-mini-hit', hitPx + 'px');
+
+            // If even the compressed form would exceed the viewport, scale the two
+            // interaction dimensions together instead of clipping prompt markers.
+            var desiredH = count * hitPx + Math.max(0, count - 1) * gapPx + 20;
+            var maxH = Math.max(180, window.innerHeight * 0.82);
+            if (desiredH > maxH && count > 18) {
+                var scale = maxH / desiredH;
+                hitPx = Math.max(4, Math.floor(hitPx * scale));
+                gapPx = Math.max(0, Math.floor(gapPx * scale));
+                rail.style.setProperty('--acn-mini-gap', gapPx + 'px');
+                rail.style.setProperty('--acn-mini-hit', hitPx + 'px');
+            }
 
             _questions.forEach(function (q, idx) {
                 var mark = createElement('button', { className: 'acn-mini-mark' });
@@ -5729,18 +5757,23 @@
             '.acn-zone.acn-dragging{opacity:0.7}',
 
             // Compact prompt rail — ChatGPT-style short dashes, left of the orbital controls.
-            '.acn-mini-rail{position:absolute;right:82px;transform:translateY(-50%);width:36px;',
-            'display:flex;flex-direction:column;align-items:flex-end;justify-content:space-between;',
-            'gap:var(--acn-mini-gap,2px);padding:7px 4px;pointer-events:auto;z-index:9;',
+            '.acn-mini-rail{position:absolute;right:82px;transform:translateY(-50%);width:44px;',
+            'display:flex;flex-direction:column;align-items:flex-end;justify-content:center;',
+            'gap:var(--acn-mini-gap,15px);padding:10px 4px;pointer-events:auto;z-index:9;',
             'opacity:.34;transition:opacity .16s ease,filter .16s ease;overflow:visible}',
             '.acn-mini-rail:hover{opacity:.92}',
             '.acn-mini-rail.acn-mini-hidden{display:none}',
-            '.acn-mini-mark{position:relative;display:block;width:11px;height:2px;min-height:1px;max-height:3px;',
-            'flex:1 1 auto;border:0;padding:0;border-radius:999px;background:rgba(20,20,20,.52);',
-            'opacity:.62;cursor:pointer;transition:width .14s ease,opacity .14s ease,transform .14s ease,background .14s ease;',
-            'transform-origin:right center}',
-            '.acn-mini-mark:hover{width:20px;opacity:1;transform:scaleY(1.3)}',
-            '.acn-mini-mark.acn-mini-active{width:24px;opacity:1;background:rgba(0,0,0,.92);transform:scaleY(1.35)}',
+            // The BUTTON is the hit target; the ::before pseudo-element is the thin visible dash.
+            // This keeps the rail visually quiet while making each prompt easy to acquire with a mouse.
+            '.acn-mini-mark{position:relative;display:block;width:30px;height:var(--acn-mini-hit,14px);',
+            'min-height:var(--acn-mini-hit,14px);flex:0 0 var(--acn-mini-hit,14px);border:0;padding:0;',
+            'background:transparent;opacity:.72;cursor:pointer;overflow:visible}',
+            '.acn-mini-mark::before{content:"";position:absolute;right:0;top:50%;width:11px;height:2px;',
+            'transform:translateY(-50%);border-radius:999px;background:rgba(20,20,20,.52);',
+            'transition:width .14s ease,opacity .14s ease,transform .14s ease,background .14s ease}',
+            '.acn-mini-mark:hover::before{width:22px;opacity:1;transform:translateY(-50%) scaleY(1.3)}',
+            '.acn-mini-mark.acn-mini-active::before{width:26px;opacity:1;background:rgba(0,0,0,.92);',
+            'transform:translateY(-50%) scaleY(1.35)}',
             '.acn-mini-tip{position:absolute;right:calc(100% + 9px);top:50%;transform:translateY(-50%) translateX(4px);',
             'max-width:320px;min-width:140px;padding:6px 9px;border-radius:8px;background:rgba(20,20,20,.94);',
             'color:#fff;font-size:11px;font-weight:500;line-height:1.35;white-space:normal;',
@@ -5748,8 +5781,8 @@
             'transition:opacity .12s ease,transform .12s ease;z-index:30}',
             '.acn-mini-mark:hover .acn-mini-tip{opacity:1;visibility:visible;transform:translateY(-50%) translateX(0)}',
             '@media(prefers-color-scheme:dark){',
-            '.acn-mini-mark{background:rgba(255,255,255,.48)}',
-            '.acn-mini-mark.acn-mini-active{background:rgba(255,255,255,.95)}',
+            '.acn-mini-mark::before{background:rgba(255,255,255,.48)}',
+            '.acn-mini-mark.acn-mini-active::before{background:rgba(255,255,255,.95)}',
             '.acn-mini-tip{background:rgba(10,10,10,.96);color:#f5f5f5}',
             '}',
 
