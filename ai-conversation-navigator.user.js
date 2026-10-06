@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI Conversation Navigator
 // @namespace    http://tampermonkey.net/
-// @version      12.9
+// @version      12.10
 // @description  Orbital navigation interface for AI chat platforms — Claude, ChatGPT, Grok, Gemini, Bolt, Lovable, Replit, V0, Base44, Emergent, Perplexity, and Firebase Studio
 // @updateURL    https://raw.githubusercontent.com/epodak/ai-conversation-navigator/main/ai-conversation-navigator.user.js
 // @downloadURL  https://raw.githubusercontent.com/epodak/ai-conversation-navigator/main/ai-conversation-navigator.user.js
@@ -42,7 +42,7 @@
     // ============================================================
     // VERSION
     // ============================================================
-    var ACN_VERSION = '12.9';
+    var ACN_VERSION = '12.10';
 
     // ============================================================
     // i18n — internationalization string table
@@ -4908,6 +4908,15 @@
     var orbScrollInverted = false; // true = natural scroll
     var orbSearchQuery = '';
 
+    // Compact prompt rail: a low-attention, always-available minimap of user turns.
+    // It is intentionally independent from the full Navigate panel: clicking a dash
+    // jumps directly to that prompt without opening the 310px panel.
+    var orbMiniRailVisible = true;
+    var _miniRailActiveIdx = -1;
+    var _miniRailFingerprint = '';
+    var _miniRailRaf = 0;
+    var _miniRailSpyAttached = false;
+
     // ── Zone drag state ─────────────────────────────────────────
     var _orbYRatio              = 0.5;   // vertical center as fraction of viewport height
     var _orbDragActive          = false; // true while mouse is held down
@@ -4923,6 +4932,7 @@
             orbMode           = saved.mode      || 'show-all';
             orbScrollInverted = saved.natural   === true;
             _panelWidth       = saved.panelWidth || 310;
+            orbMiniRailVisible = saved.miniRailVisible !== false;
         } catch (e) {}
     }
     function orbSaveSettings() {
@@ -4931,6 +4941,7 @@
                 mode:       orbMode,
                 natural:    orbScrollInverted,
                 panelWidth: _panelWidth,
+                miniRailVisible: orbMiniRailVisible,
             }));
         } catch (e) {}
     }
@@ -5037,8 +5048,155 @@
         window.addEventListener('resize', _orbResizeHandler);
     }
 
+    // ── Compact prompt rail ─────────────────────────────────────
+    function _miniRailSetVisible(visible, persist) {
+        orbMiniRailVisible = !!visible;
+        var rail = document.getElementById('acn-mini-rail');
+        if (rail) rail.classList.toggle('acn-mini-hidden', !orbMiniRailVisible);
+        var zone = document.getElementById('acn-zone');
+        if (zone) zone.setAttribute('data-acn-mini-rail', orbMiniRailVisible ? 'visible' : 'hidden');
+        if (persist !== false) orbSaveSettings();
+    }
+
+    function _miniRailQuestionIndexForElement(el) {
+        if (!el) return -1;
+        var text = _readMessageText(el);
+        var key = null;
+        try { key = _vsMessageKey(el, text); } catch (e) {}
+
+        for (var i = 0; i < _questions.length; i++) {
+            var q = _questions[i];
+            if (q.element === el) return i;
+            if (key && q.messageKey && q.messageKey === key) return i;
+        }
+        var wanted = _normalizeFull(text);
+        if (!wanted) return -1;
+        for (var j = 0; j < _questions.length; j++) {
+            if (_normalizeFull(_questions[j].text) === wanted) return j;
+        }
+        return -1;
+    }
+
+    function _miniRailDetectActiveIndex() {
+        var live = Array.from(getUserMessages());
+        if (!live.length) return _miniRailActiveIdx;
+
+        // The prompt nearest the upper third of the viewport best matches what the
+        // user perceives as the current turn while still behaving sensibly near edges.
+        var anchorY = window.innerHeight * 0.34;
+        var best = null;
+        var bestDist = Infinity;
+        for (var i = 0; i < live.length; i++) {
+            var r;
+            try { r = live[i].getBoundingClientRect(); } catch (e) { continue; }
+            if (r.bottom < -80 || r.top > window.innerHeight + 80) continue;
+            var y = Math.max(r.top, Math.min(anchorY, r.bottom));
+            var d = Math.abs(y - anchorY);
+            if (d < bestDist) { bestDist = d; best = live[i]; }
+        }
+        var idx = _miniRailQuestionIndexForElement(best);
+        return idx >= 0 ? idx : _miniRailActiveIdx;
+    }
+
+    function _miniRailApplyActive(idx) {
+        _miniRailActiveIdx = idx;
+        var marks = document.querySelectorAll('#acn-mini-rail .acn-mini-mark');
+        for (var i = 0; i < marks.length; i++) {
+            marks[i].classList.toggle('acn-mini-active', i === idx);
+        }
+    }
+
+    function _miniRailScheduleSpy() {
+        if (!orbMiniRailVisible || _miniRailRaf) return;
+        _miniRailRaf = requestAnimationFrame(function () {
+            _miniRailRaf = 0;
+            var idx = _miniRailDetectActiveIndex();
+            if (idx !== _miniRailActiveIdx) _miniRailApplyActive(idx);
+        });
+    }
+
+    function _miniRailAttachSpy() {
+        if (_miniRailSpyAttached) return;
+        _miniRailSpyAttached = true;
+        // Capture phase sees scroll events from nested ChatGPT/Claude scrollers.
+        document.addEventListener('scroll', _miniRailScheduleSpy, true);
+        window.addEventListener('resize', function () {
+            orbRefreshMiniRail();
+            _miniRailScheduleSpy();
+        });
+    }
+
+    function orbRefreshMiniRail() {
+        var rail = document.getElementById('acn-mini-rail');
+        if (!rail) return;
+
+        rail.classList.toggle('acn-mini-hidden', !orbMiniRailVisible);
+        if (!orbMiniRailVisible) return;
+
+        var fp = _questions.map(function (q) {
+            return (q.messageKey || '') + ':' + (q.text || '').substring(0, 80);
+        }).join('|') + '|g' + _ciIndexGen;
+
+        if (fp !== _miniRailFingerprint) {
+            _miniRailFingerprint = fp;
+            while (rail.firstChild) rail.removeChild(rail.firstChild);
+
+            var count = _questions.length;
+            if (!count) {
+                rail.style.height = '0px';
+                rail.style.pointerEvents = 'none';
+                return;
+            }
+            rail.style.pointerEvents = 'auto';
+
+            // Scale gracefully from short chats to 100+ turn research threads.
+            var maxH = Math.min(window.innerHeight * 0.56, 420);
+            var targetH = Math.min(maxH, Math.max(34, count * (count > 120 ? 2.2 : count > 60 ? 3.2 : 5.6)));
+            rail.style.height = Math.round(targetH) + 'px';
+            rail.style.setProperty('--acn-mini-gap',
+                count > 140 ? '0px' : count > 80 ? '1px' : count > 36 ? '1.5px' : '3px');
+
+            _questions.forEach(function (q, idx) {
+                var mark = createElement('button', { className: 'acn-mini-mark' });
+                mark.type = 'button';
+                mark.setAttribute('data-acn-role', 'mini-nav-marker');
+                mark.setAttribute('data-acn-index', String(idx));
+                mark.setAttribute('aria-label', 'Jump to question ' + (idx + 1));
+
+                var summary = (q.summary || q.text || '').trim().replace(/\s+/g, ' ');
+                if (summary.length > 180) summary = summary.substring(0, 177) + '...';
+                var tip = createElement('span', {
+                    className: 'acn-mini-tip',
+                    textContent: 'Q' + (idx + 1) + '  ' + summary
+                });
+                mark.appendChild(tip);
+
+                mark.addEventListener('click', (function (question, qIdx) {
+                    return function (e) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        _miniRailApplyActive(qIdx);
+                        if (orbPanel) {
+                            orbClosePanel();
+                            setTimeout(function () { orbScrollToQuestion(question); }, 180);
+                        } else {
+                            orbScrollToQuestion(question);
+                        }
+                    };
+                })(q, idx));
+
+                rail.appendChild(mark);
+            });
+        }
+
+        rail.style.top = _orbGetCy() + 'px';
+        var active = _miniRailDetectActiveIndex();
+        if (active >= 0) _miniRailApplyActive(active);
+    }
+
     // ── Orbital panel update hook (called by scanConversation) ──
     function orbOnScanComplete() {
+        orbRefreshMiniRail();
         if (orbPanel === 'nav')    orbPopulateNavigate();
         if (orbPanel === 'search') orbPopulateSearch(orbSearchQuery);
         updateTurnCounter();
@@ -5570,6 +5728,31 @@
             '.acn-hitzone{position:absolute;right:0;z-index:1;pointer-events:auto;cursor:ns-resize}',
             '.acn-zone.acn-dragging{opacity:0.7}',
 
+            // Compact prompt rail — ChatGPT-style short dashes, left of the orbital controls.
+            '.acn-mini-rail{position:absolute;right:82px;transform:translateY(-50%);width:36px;',
+            'display:flex;flex-direction:column;align-items:flex-end;justify-content:space-between;',
+            'gap:var(--acn-mini-gap,2px);padding:7px 4px;pointer-events:auto;z-index:9;',
+            'opacity:.34;transition:opacity .16s ease,filter .16s ease;overflow:visible}',
+            '.acn-mini-rail:hover{opacity:.92}',
+            '.acn-mini-rail.acn-mini-hidden{display:none}',
+            '.acn-mini-mark{position:relative;display:block;width:11px;height:2px;min-height:1px;max-height:3px;',
+            'flex:1 1 auto;border:0;padding:0;border-radius:999px;background:rgba(20,20,20,.52);',
+            'opacity:.62;cursor:pointer;transition:width .14s ease,opacity .14s ease,transform .14s ease,background .14s ease;',
+            'transform-origin:right center}',
+            '.acn-mini-mark:hover{width:20px;opacity:1;transform:scaleY(1.3)}',
+            '.acn-mini-mark.acn-mini-active{width:24px;opacity:1;background:rgba(0,0,0,.92);transform:scaleY(1.35)}',
+            '.acn-mini-tip{position:absolute;right:calc(100% + 9px);top:50%;transform:translateY(-50%) translateX(4px);',
+            'max-width:320px;min-width:140px;padding:6px 9px;border-radius:8px;background:rgba(20,20,20,.94);',
+            'color:#fff;font-size:11px;font-weight:500;line-height:1.35;white-space:normal;',
+            'box-shadow:0 6px 24px rgba(0,0,0,.22);opacity:0;visibility:hidden;pointer-events:none;',
+            'transition:opacity .12s ease,transform .12s ease;z-index:30}',
+            '.acn-mini-mark:hover .acn-mini-tip{opacity:1;visibility:visible;transform:translateY(-50%) translateX(0)}',
+            '@media(prefers-color-scheme:dark){',
+            '.acn-mini-mark{background:rgba(255,255,255,.48)}',
+            '.acn-mini-mark.acn-mini-active{background:rgba(255,255,255,.95)}',
+            '.acn-mini-tip{background:rgba(10,10,10,.96);color:#f5f5f5}',
+            '}',
+
             // Dots — critical: fast opacity, slow position
             '.acn-dot{position:absolute;display:flex;align-items:center;justify-content:center;',
             'border-radius:50%;cursor:pointer;z-index:5;color:#000;font-weight:600;',
@@ -5873,6 +6056,8 @@
 
         var cy   = _orbGetCy();
         var show = orbHovering || orbPanel !== null;
+        var miniRail = document.getElementById('acn-mini-rail');
+        if (miniRail) miniRail.style.top = cy + 'px';
 
         // Wheel/arc hint
         var hint = document.getElementById('acn-whint');
@@ -11971,6 +12156,23 @@
             dirSel,
         ]));
 
+        var railToggle = createElement('div', {
+            className: 'acn-toggle' + (orbMiniRailVisible ? ' acn-on' : '')
+        });
+        railToggle.setAttribute('role', 'switch');
+        railToggle.setAttribute('aria-label', 'Prompt rail');
+        railToggle.setAttribute('aria-checked', orbMiniRailVisible ? 'true' : 'false');
+        railToggle.addEventListener('click', function () {
+            _miniRailSetVisible(!orbMiniRailVisible, true);
+            railToggle.classList.toggle('acn-on', orbMiniRailVisible);
+            railToggle.setAttribute('aria-checked', orbMiniRailVisible ? 'true' : 'false');
+            if (orbMiniRailVisible) orbRefreshMiniRail();
+        });
+        dispGroup.appendChild(createElement('div', { className: 'acn-set-row' }, [
+            createElement('div', { className: 'acn-set-label', textContent: 'Prompt rail' }),
+            railToggle,
+        ]));
+
         scroll.appendChild(dispGroup);
 
         // ── Language group ─────────────────────────────────────────────
@@ -12130,6 +12332,12 @@
 
             orbSetMode('show-all');
             orbScrollInverted = false;
+            orbMiniRailVisible = true;
+            _miniRailSetVisible(true, false);
+            if (typeof railToggle !== 'undefined' && railToggle) {
+                railToggle.classList.add('acn-on');
+                railToggle.setAttribute('aria-checked', 'true');
+            }
             orbSaveSettings();
 
             var fresh = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
@@ -12198,6 +12406,13 @@
         var hint = createElement('div', { id: 'acn-whint', className: 'acn-whint' });
         hint.appendChild(createElement('span', null, ['\u2195 scroll']));
         zone.appendChild(hint);
+
+        // Compact prompt rail. It is a sibling of the hitzone so hovering it does
+        // not unnecessarily wake the whole orbital button stack.
+        var miniRail = createElement('div', { id: 'acn-mini-rail', className: 'acn-mini-rail' });
+        miniRail.setAttribute('data-acn-role', 'mini-nav');
+        miniRail.classList.toggle('acn-mini-hidden', !orbMiniRailVisible);
+        zone.appendChild(miniRail);
 
         // Feature dots
         orbDots = [];
@@ -12391,6 +12606,8 @@
         var zone = orbBuildZone();
         document.body.appendChild(zone);
         orbUpdateHitzone(); // must run after zone is in DOM so getElementById works
+        _miniRailAttachSpy();
+        orbRefreshMiniRail();
 
         // Apply saved panel width via CSS variable (before panels are built)
         document.documentElement.style.setProperty('--acn-panel-w', _panelWidth + 'px');
@@ -12775,9 +12992,19 @@
     }
 
     // ============================================================
-    // E2: Keyboard listener — Ctrl+/ toggles command palette
+    // Keyboard shortcuts — Alt+N toggles compact rail; Ctrl+/ opens commands
     // ============================================================
     document.addEventListener('keydown', function (e) {
+        var target = e.target;
+        var typing = target && (target.isContentEditable ||
+                     target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' ||
+                     (target.getAttribute && target.getAttribute('role') === 'textbox'));
+        if (e.altKey && !e.ctrlKey && !e.metaKey && String(e.key).toLowerCase() === 'n' && !typing) {
+            e.preventDefault();
+            _miniRailSetVisible(!orbMiniRailVisible, true);
+            if (orbMiniRailVisible) orbRefreshMiniRail();
+            return;
+        }
         if ((e.ctrlKey || e.metaKey) && e.key === '/') {
             e.preventDefault();
             _paletteInputTriggered = false; // Ctrl+/ always uses focused palette
