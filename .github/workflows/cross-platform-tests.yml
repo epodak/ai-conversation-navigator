@@ -62,3 +62,4 @@ jobs:
           node probes/check-tokenizer.js --browser chromium
           node probes/check-subsegments.js --browser chromium
           node probes/check-usage-state.js --browser chromium
+          node probes/check-chatgpt-virtualization.js
