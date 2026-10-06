@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI Conversation Navigator
 // @namespace    http://tampermonkey.net/
-// @version      12.8
+// @version      12.9
 // @description  Orbital navigation interface for AI chat platforms — Claude, ChatGPT, Grok, Gemini, Bolt, Lovable, Replit, V0, Base44, Emergent, Perplexity, and Firebase Studio
 // @match        https://claude.ai/*
 // @match        https://chatgpt.com/*
@@ -40,7 +40,7 @@
     // ============================================================
     // VERSION
     // ============================================================
-    var ACN_VERSION = '12.8';
+    var ACN_VERSION = '12.9';
 
     // ============================================================
     // i18n — internationalization string table
@@ -345,8 +345,11 @@
             icon: '\u23E3',
             layout: 'standard',
             useOrbital: true,
-            virtualScroll: false,
-            spa: false,
+            // ChatGPT switched its conversation timeline to a virtualized,
+            // column-reverse scroller in 2026. Off-screen turns are unmounted, so
+            // rebuilding the navigator from the current DOM window loses history.
+            virtualScroll: true,
+            spa: true,
             scrollbarOffset: 0,
             boundarySelectors: null,
             boundaryStrategy: null,
@@ -354,6 +357,37 @@
             initGuards: [],
             retryDelays: [],
             textExtractor: null,
+            // Stable ordering/identity hooks for the generic virtual-scroll cache.
+            // conversation-turn-N survives recycling; message ids survive rerenders.
+            getVirtualIndex: function (msg) {
+                var turn = msg && msg.closest
+                    ? msg.closest('article[data-testid^="conversation-turn-"]')
+                    : null;
+                if (!turn) return null;
+                var testid = turn.getAttribute('data-testid') || '';
+                var m = testid.match(/^conversation-turn-(\d+)$/);
+                return m ? parseInt(m[1], 10) : null;
+            },
+            getMessageKey: function (msg) {
+                if (!msg) return null;
+                var mid = msg.getAttribute && msg.getAttribute('data-message-id');
+                if (mid) return 'message:' + mid;
+                var turn = msg.closest
+                    ? msg.closest('article[data-testid^="conversation-turn-"]')
+                    : null;
+                if (turn) {
+                    var tid = turn.getAttribute('data-turn-id');
+                    if (tid) return 'turn:' + tid;
+                    var testid = turn.getAttribute('data-testid');
+                    if (testid) return 'testid:' + testid;
+                }
+                return null;
+            },
+            getScrollContainer: function () {
+                return document.querySelector('[data-app-action-timeline-scroll]') ||
+                       document.querySelector('main [class*="overflow-y-auto"]') ||
+                       document.scrollingElement;
+            },
             getUserMessages: function () {
                 var allMessages = document.querySelectorAll('[data-message-author-role]');
                 var messages = Array.from(allMessages).filter(function (msg) {
@@ -4145,6 +4179,29 @@
         return false;
     }
 
+    // Virtual-scroll helpers. Platforms may provide stable identity/order hooks;
+    // otherwise retain the old text/data-index fallback for existing adapters.
+    function _vsMessageKey(msg, text) {
+        if (platform && typeof platform.getMessageKey === 'function') {
+            var stable = platform.getMessageKey(msg);
+            if (stable) return platform.id + '|' + stable;
+        }
+        return _normalizeKey(text);
+    }
+
+    function _vsMessageIndex(msg, fallback) {
+        if (platform && typeof platform.getVirtualIndex === 'function') {
+            var idx = platform.getVirtualIndex(msg);
+            if (typeof idx === 'number' && isFinite(idx)) return idx;
+        }
+        var virtuosoItem = msg && msg.closest ? msg.closest('[data-index]') : null;
+        if (virtuosoItem) {
+            var parsed = parseInt(virtuosoItem.getAttribute('data-index'), 10);
+            if (isFinite(parsed)) return parsed;
+        }
+        return fallback;
+    }
+
     function scanConversation(forceReset) {
         // ── Claude: index-backed path ────────────────────────────
         // The DOM holds ~3% of a long conversation, so it cannot be the source of
@@ -4301,14 +4358,17 @@
             messages.forEach(function (msg) {
                 var text = _readMessageText(msg);
                 if (!text.trim()) return;
-                var key = _normalizeKey(text);
+                var key = _vsMessageKey(msg, text);
                 if (!_vsAccumulatedKeys.has(key)) {
                     _vsAccumulatedKeys.add(key);
-                    var virtuosoItem = msg.closest('[data-index]');
-                    var vsIndex = virtuosoItem
-                        ? parseInt(virtuosoItem.getAttribute('data-index'), 10)
-                        : _questions.length;
-                    _questions.push({ element: msg, text: text, summary: generateSummary(text), vsIndex: vsIndex });
+                    var vsIndex = _vsMessageIndex(msg, _questions.length);
+                    _questions.push({
+                        element: msg,
+                        text: text,
+                        summary: generateSummary(text),
+                        vsIndex: vsIndex,
+                        messageKey: key
+                    });
                     addedNew = true;
                 }
             });
@@ -4323,13 +4383,16 @@
                     var text = _readMessageText(msg);
                     if (!text.trim()) return;
                     if (isVirtualScroll) {
-                        var key = _normalizeKey(text);
+                        var key = _vsMessageKey(msg, text);
                         _vsAccumulatedKeys.add(key);
-                        var virtuosoItem = msg.closest('[data-index]');
-                        var vsIndex = virtuosoItem
-                            ? parseInt(virtuosoItem.getAttribute('data-index'), 10)
-                            : _questions.length;
-                        _questions.push({ element: msg, text: text, summary: generateSummary(text), vsIndex: vsIndex });
+                        var vsIndex = _vsMessageIndex(msg, _questions.length);
+                        _questions.push({
+                            element: msg,
+                            text: text,
+                            summary: generateSummary(text),
+                            vsIndex: vsIndex,
+                            messageKey: key
+                        });
                     } else {
                         _questions.push({ element: msg, text: text, summary: generateSummary(text) });
                     }
@@ -5860,8 +5923,14 @@
         }
 
         if (stat) {
-            stat.textContent = _questions.length + ' question' +
-                (_questions.length !== 1 ? 's' : '') + ' detected';
+            if (platform.id === 'chatgpt' && isVirtualScroll) {
+                stat.textContent = _questions.length + ' question' +
+                    (_questions.length !== 1 ? 's' : '') +
+                    ' indexed · scroll to discover older turns';
+            } else {
+                stat.textContent = _questions.length + ' question' +
+                    (_questions.length !== 1 ? 's' : '') + ' detected';
+            }
             stat.setAttribute('data-acn-count', String(_questions.length));
         }
 
@@ -6316,16 +6385,111 @@
         // the same DOM node for a different message, so a still-connected node can be
         // displaying different content — the same trap the bookmark-icon guard
         // documents. Re-validate the text before trusting the cached reference.
-        if (q.element && q.element.isConnected &&
-            _normalizeKey(_readMessageText(q.element)) === _normalizeKey(q.text)) {
-            return q.element;
+        if (q.element && q.element.isConnected) {
+            var liveText = _readMessageText(q.element);
+            if (q.messageKey) {
+                if (_vsMessageKey(q.element, liveText) === q.messageKey) return q.element;
+            } else if (_normalizeKey(liveText) === _normalizeKey(q.text)) {
+                return q.element;
+            }
         }
         var wanted  = _normalizeKey(q.text);
         var current = Array.from(getUserMessages());
         for (var i = 0; i < current.length; i++) {
-            if (_normalizeKey(_readMessageText(current[i])) === wanted) return current[i];
+            var currentText = _readMessageText(current[i]);
+            if (q.messageKey) {
+                if (_vsMessageKey(current[i], currentText) === q.messageKey) return current[i];
+            } else if (_normalizeKey(currentText) === wanted) {
+                return current[i];
+            }
         }
         return null;
+    }
+
+    // ChatGPT 2026 virtualizes the timeline and uses a column-reverse scroll
+    // container. A stored q.element therefore goes stale as soon as its turn leaves
+    // the mount window. Page toward the target's stable conversation-turn-N until
+    // the virtualizer mounts it again, then use the normal verified fast path.
+    var _chatgptJumpToken = 0;
+
+    function _chatgptJumpToVirtualQuestion(q, done) {
+        var scroller = platform && typeof platform.getScrollContainer === 'function'
+            ? platform.getScrollContainer()
+            : null;
+        if (!scroller || typeof q.vsIndex !== 'number' || !isFinite(q.vsIndex)) {
+            done(false, null, 'unavailable');
+            return;
+        }
+
+        var token = ++_chatgptJumpToken;
+        var attempts = 0;
+        var stalled = 0;
+        var maxAttempts = 80;
+        orbSetJumpBusy(true);
+
+        function finish(ok, el, reason) {
+            if (token !== _chatgptJumpToken) return;
+            orbSetJumpBusy(false);
+            done(ok, el || null, reason || null);
+        }
+
+        function tick() {
+            if (token !== _chatgptJumpToken) return;
+
+            var hit = _relocateQuestionElement(q);
+            if (hit) {
+                finish(true, hit, null);
+                return;
+            }
+            if (attempts++ >= maxAttempts) {
+                finish(false, null, 'not-found');
+                return;
+            }
+
+            var mounted = Array.from(getUserMessages());
+            var indices = [];
+            for (var i = 0; i < mounted.length; i++) {
+                var vi = _vsMessageIndex(mounted[i], null);
+                if (typeof vi === 'number' && isFinite(vi)) indices.push(vi);
+            }
+
+            var viewport = Math.max(scroller.clientHeight || 0, 600);
+            var step = viewport * 0.9;
+            var direction = -1; // older / visually upward
+
+            if (indices.length) {
+                var minIdx = Math.min.apply(Math, indices);
+                var maxIdx = Math.max.apply(Math, indices);
+                var gap;
+                if (q.vsIndex < minIdx) {
+                    direction = -1;
+                    gap = minIdx - q.vsIndex;
+                } else if (q.vsIndex > maxIdx) {
+                    direction = 1;
+                    gap = q.vsIndex - maxIdx;
+                } else {
+                    direction = q.vsIndex < (minIdx + maxIdx) / 2 ? -1 : 1;
+                    gap = 1;
+                }
+                step *= Math.max(1, Math.min(4, gap / 4));
+            }
+
+            var before = scroller.scrollTop;
+            scroller.scrollTop = before + direction * step;
+            var after = scroller.scrollTop;
+            if (Math.abs(after - before) < 1) stalled++;
+            else stalled = 0;
+
+            if (stalled >= 4) {
+                finish(false, null, 'boundary');
+                return;
+            }
+
+            // ChatGPT's virtualizer commits the new mount window asynchronously.
+            setTimeout(tick, 120);
+        }
+
+        tick();
     }
 
     function orbScrollToQuestion(q) {
@@ -6342,6 +6506,28 @@
         // here and keep the plain behaviour — the seam stays clean for the
         // cross-platform audit to add platforms later.
         if (!target) {
+            // ChatGPT now virtualizes its conversation timeline. Unlike Claude we
+            // do not have an API-backed full tree here, but every harvested turn
+            // carries a stable conversation-turn-N ordinal, so page the virtualizer
+            // until that exact turn remounts.
+            if (platform.id === 'chatgpt' && isVirtualScroll &&
+                typeof q.vsIndex === 'number' && isFinite(q.vsIndex)) {
+                _chatgptJumpToVirtualQuestion(q, function (ok, el, reason) {
+                    if (ok && el) {
+                        q.element = el;
+                        orbMarkJumpTarget(el);
+                        el.scrollIntoView({
+                            behavior: _prefersReducedMotion() ? 'auto' : 'smooth',
+                            block: 'center'
+                        });
+                        orbFlashElement(el);
+                    } else if (reason !== 'superseded') {
+                        showToast('That message could not be remounted — scroll toward it and try again');
+                    }
+                });
+                return;
+            }
+
             // pathIndex must be a REAL position in the active path. Provisional
             // entries (DOM-merged, not yet in the index) carry MAX_SAFE_INTEGER as
             // a sort key — jumping to that would burn all 8 iterations chasing a
