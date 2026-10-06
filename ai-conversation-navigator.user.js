@@ -1,8 +1,10 @@
 // ==UserScript==
 // @name         AI Conversation Navigator
 // @namespace    http://tampermonkey.net/
-// @version      12.8
+// @version      12.9
 // @description  Orbital navigation interface for AI chat platforms — Claude, ChatGPT, Grok, Gemini, Bolt, Lovable, Replit, V0, Base44, Emergent, Perplexity, and Firebase Studio
+// @updateURL    https://raw.githubusercontent.com/epodak/ai-conversation-navigator/main/ai-conversation-navigator.user.js
+// @downloadURL  https://raw.githubusercontent.com/epodak/ai-conversation-navigator/main/ai-conversation-navigator.user.js
 // @match        https://claude.ai/*
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -40,7 +42,7 @@
     // ============================================================
     // VERSION
     // ============================================================
-    var ACN_VERSION = '12.8';
+    var ACN_VERSION = '12.9';
 
     // ============================================================
     // i18n — internationalization string table
@@ -345,8 +347,11 @@
             icon: '\u23E3',
             layout: 'standard',
             useOrbital: true,
-            virtualScroll: false,
-            spa: false,
+            // ChatGPT switched its conversation timeline to a virtualized,
+            // column-reverse scroller in 2026. Off-screen turns are unmounted, so
+            // rebuilding the navigator from the current DOM window loses history.
+            virtualScroll: true,
+            spa: true,
             scrollbarOffset: 0,
             boundarySelectors: null,
             boundaryStrategy: null,
@@ -354,23 +359,89 @@
             initGuards: [],
             retryDelays: [],
             textExtractor: null,
-            getUserMessages: function () {
-                var allMessages = document.querySelectorAll('[data-message-author-role]');
-                var messages = Array.from(allMessages).filter(function (msg) {
-                    return msg.getAttribute('data-message-author-role') === 'user';
-                });
-                if (messages.length === 0) {
-                    messages = document.querySelectorAll('div.self-end.bg-token-bg-tertiary');
+            // Stable ordering/identity hooks for the generic virtual-scroll cache.
+            // conversation-turn-N survives recycling; message ids survive rerenders.
+            getVirtualIndex: function (msg) {
+                var turn = msg && msg.closest
+                    ? msg.closest('[data-testid^="conversation-turn-"], [data-turn-key]')
+                    : null;
+                if (!turn) return null;
+                var testid = turn.getAttribute('data-testid') || '';
+                var m = testid.match(/conversation-turn-(\d+)/);
+                return m ? parseInt(m[1], 10) : null;
+            },
+            getMessageKey: function (msg) {
+                if (!msg) return null;
+                var mid = msg.getAttribute && msg.getAttribute('data-message-id');
+                if (mid) return 'message:' + mid;
+
+                var ids = msg.getAttribute && msg.getAttribute('data-chatgpt-search-message-ids');
+                if (ids) {
+                    var one = ids;
+                    try {
+                        var parsedIds = JSON.parse(ids);
+                        if (Array.isArray(parsedIds) && parsedIds.length === 1) one = parsedIds[0];
+                    } catch (e) {
+                        var parts = ids.split(/[\s,]+/).filter(Boolean);
+                        if (parts.length === 1) one = parts[0];
+                    }
+                    if (one) return 'message:' + one;
                 }
-                return messages;
+
+                var unitKey = msg.getAttribute && msg.getAttribute('data-chatgpt-search-unit-key');
+                if (unitKey) return 'unit:' + unitKey;
+
+                var turn = msg.closest
+                    ? msg.closest('[data-testid^="conversation-turn-"], [data-turn-key]')
+                    : null;
+                if (turn) {
+                    var tid = turn.getAttribute('data-turn-id') || turn.getAttribute('data-turn-key');
+                    if (tid) return 'turn:' + tid;
+                    var testid = turn.getAttribute('data-testid');
+                    if (testid) return 'testid:' + testid;
+                }
+                return null;
+            },
+            getScrollContainer: function () {
+                return document.querySelector('[data-app-action-timeline-scroll]') ||
+                       document.querySelector('main [class*="overflow-y-auto"]') ||
+                       document.scrollingElement;
+            },
+            getUserMessages: function () {
+                var messages = Array.from(
+                    document.querySelectorAll('[data-message-author-role="user"]')
+                );
+                if (messages.length === 0) {
+                    messages = Array.from(
+                        document.querySelectorAll('[data-chatgpt-search-unit-key$=":user"]')
+                    );
+                }
+                if (messages.length === 0) {
+                    messages = Array.from(document.querySelectorAll('div.self-end.bg-token-bg-tertiary'));
+                }
+                return messages.filter(function (el, idx, arr) {
+                    if (!(el.textContent || '').trim()) return false;
+                    var key = this.getMessageKey ? this.getMessageKey(el) : null;
+                    if (!key) return true;
+                    for (var i = 0; i < idx; i++) {
+                        if (this.getMessageKey(arr[i]) === key) return false;
+                    }
+                    return true;
+                }, this);
             },
             getAIMessages: function () {
-                var allMessages = document.querySelectorAll('[data-message-author-role]');
-                var messages = Array.from(allMessages).filter(function (msg) {
-                    return msg.getAttribute('data-message-author-role') === 'assistant';
-                });
+                var messages = Array.from(
+                    document.querySelectorAll('[data-message-author-role="assistant"]')
+                );
                 if (messages.length === 0) {
-                    messages = Array.from(document.querySelectorAll('.markdown.prose')).filter(function (el) {
+                    messages = Array.from(
+                        document.querySelectorAll('[data-chatgpt-search-unit-key$=":assistant"]')
+                    );
+                }
+                if (messages.length === 0) {
+                    messages = Array.from(document.querySelectorAll(
+                        '[data-markdown-text-style="assistant-message"], .markdown.prose'
+                    )).filter(function (el) {
                         return !el.closest('.bg-token-bg-tertiary');
                     });
                 }
@@ -3625,6 +3696,16 @@
     // Detected questions — consumed by Navigate and Search panels
     var _questions = []; // [{ element, text, summary, vsIndex? }]
     var _vsAccumulatedKeys = new Set();
+
+    // ChatGPT virtualizes the DOM but loads the selected conversation as JSON.
+    // This read-only index makes Navigate complete before old turns are mounted.
+    var _cgptIndexStatus = 'idle'; // idle | loading | ready | degraded
+    var _cgptIndexConversationId = null;
+    var _cgptIndexQuestions = [];
+    var _cgptIndexInFlight = false;
+    var _cgptIndexRequestSeq = 0;
+    var _cgptAccessToken = null;
+    var _cgptAccessTokenAt = 0;
     var _navListFingerprint    = ''; // used to skip DOM rebuild when questions are unchanged
     var _searchListFingerprint = ''; // same guard for search panel
     var _ciIndexGen = 0;             // bumped on every index (re)build: a same-count
@@ -4145,7 +4226,273 @@
         return false;
     }
 
+    // ============================================================
+    // CHATGPT FULL-CONVERSATION PROMPT INDEX (read-only, same-origin)
+    // ============================================================
+    function _cgptConversationId() {
+        if (!platform || platform.id !== 'chatgpt') return null;
+        var m = location.pathname.match(/\/c\/([^/?#]+)/);
+        return m ? decodeURIComponent(m[1]) : null;
+    }
+
+    function _cgptResetIndex() {
+        _cgptIndexStatus = 'idle';
+        _cgptIndexConversationId = null;
+        _cgptIndexQuestions = [];
+        _cgptIndexInFlight = false;
+        _cgptIndexRequestSeq++;
+    }
+
+    function _cgptUserShells() {
+        return Array.from(document.querySelectorAll(
+            '[data-testid^="conversation-turn-"][data-turn="user"]'
+        ));
+    }
+
+    function _cgptTurnIndexFromShell(shell, fallback) {
+        if (!shell) return fallback;
+        var testid = shell.getAttribute('data-testid') || '';
+        var m = testid.match(/conversation-turn-(\d+)/);
+        return m ? parseInt(m[1], 10) : fallback;
+    }
+
+    function _cgptApiText(msg) {
+        var c = msg && msg.content;
+        if (!c) return '';
+        if (c.content_type === 'text' || c.content_type === 'multimodal_text') {
+            return (c.parts || []).filter(function (p) {
+                return typeof p === 'string';
+            }).join('\n\n').trim();
+        }
+        return '';
+    }
+
+    function _cgptLinearUserMessages(data) {
+        var mapping = data && data.mapping;
+        if (!mapping) return [];
+        var chain = [];
+        var node = data.current_node ? mapping[data.current_node] : null;
+        for (var hops = 0; node && hops < 10000; hops++) {
+            chain.push(node);
+            node = node.parent ? mapping[node.parent] : null;
+        }
+        chain.reverse();
+
+        var out = [];
+        for (var i = 0; i < chain.length; i++) {
+            var msg = chain[i].message;
+            if (!msg || !msg.author || msg.author.role !== 'user') continue;
+            if (msg.recipient && msg.recipient !== 'all') continue;
+            if (msg.metadata && msg.metadata.is_visually_hidden_from_conversation) continue;
+            var text = _cgptApiText(msg);
+            if (!text) continue;
+            out.push({ id: msg.id || null, text: text });
+        }
+        return out;
+    }
+
+    function _cgptBuildQuestions(data) {
+        var apiUsers = _cgptLinearUserMessages(data);
+        var shells = _cgptUserShells();
+        var aligned = shells.length > 0 && shells.length === apiUsers.length;
+        var out = [];
+        for (var i = 0; i < apiUsers.length; i++) {
+            var shell = aligned ? shells[i] : null;
+            var idx = _cgptTurnIndexFromShell(shell, i * 2 + 1);
+            var key = apiUsers[i].id ? 'chatgpt|message:' + apiUsers[i].id : null;
+            out.push({
+                element: null,
+                shell: shell,
+                text: apiUsers[i].text,
+                summary: generateSummary(apiUsers[i].text),
+                vsIndex: idx,
+                messageKey: key,
+                messageId: apiUsers[i].id,
+                apiBacked: true
+            });
+        }
+        return out;
+    }
+
+    function _cgptBindMountedAndMerge(indexed) {
+        var questions = indexed.map(function (q) {
+            return {
+                element: q.element || null,
+                shell: q.shell || null,
+                text: q.text,
+                summary: q.summary,
+                vsIndex: q.vsIndex,
+                messageKey: q.messageKey,
+                messageId: q.messageId,
+                apiBacked: true
+            };
+        });
+        var byKey = {};
+        for (var i = 0; i < questions.length; i++) {
+            if (questions[i].messageKey) byKey[questions[i].messageKey] = questions[i];
+        }
+
+        var mounted = Array.from(getUserMessages());
+        for (var j = 0; j < mounted.length; j++) {
+            var text = _readMessageText(mounted[j]);
+            if (!text) continue;
+            var key = _vsMessageKey(mounted[j], text);
+            var idx = _vsMessageIndex(mounted[j], questions.length * 2 + 1);
+            var q = byKey[key];
+            if (q) {
+                q.element = mounted[j];
+                if (_normalizeFull(q.text) !== _normalizeFull(text)) {
+                    q.text = text;
+                    q.summary = generateSummary(text);
+                }
+                if (!q.shell && mounted[j].closest) {
+                    q.shell = mounted[j].closest('[data-testid^="conversation-turn-"], [data-turn-key]');
+                }
+                if (typeof idx === 'number' && isFinite(idx)) q.vsIndex = idx;
+                continue;
+            }
+
+            var liveQ = {
+                element: mounted[j],
+                shell: mounted[j].closest
+                    ? mounted[j].closest('[data-testid^="conversation-turn-"], [data-turn-key]')
+                    : null,
+                text: text,
+                summary: generateSummary(text),
+                vsIndex: idx,
+                messageKey: key,
+                messageId: null,
+                apiBacked: false
+            };
+            questions.push(liveQ);
+            byKey[key] = liveQ;
+        }
+
+        questions.sort(function (a, b) {
+            return (typeof a.vsIndex === 'number' ? a.vsIndex : 0) -
+                   (typeof b.vsIndex === 'number' ? b.vsIndex : 0);
+        });
+        return questions;
+    }
+
+    function _cgptEnsureIndex(force) {
+        var id = _cgptConversationId();
+        if (!id) return;
+
+        if (_cgptIndexConversationId && _cgptIndexConversationId !== id) {
+            _cgptResetIndex();
+        }
+        if (!force && _cgptIndexStatus === 'ready' && _cgptIndexConversationId === id) return;
+        if (_cgptIndexInFlight) return;
+
+        _cgptIndexInFlight = true;
+        _cgptIndexStatus = 'loading';
+        var seq = ++_cgptIndexRequestSeq;
+
+        function tokenPromise() {
+            if (_cgptAccessToken && Date.now() - _cgptAccessTokenAt < 10 * 60 * 1000) {
+                return Promise.resolve(_cgptAccessToken);
+            }
+            return fetch('/api/auth/session', { credentials: 'include' })
+                .then(function (res) {
+                    if (!res.ok) throw new Error('session HTTP ' + res.status);
+                    return res.json();
+                })
+                .then(function (data) {
+                    if (!data || !data.accessToken) throw new Error('no access token');
+                    _cgptAccessToken = data.accessToken;
+                    _cgptAccessTokenAt = Date.now();
+                    return _cgptAccessToken;
+                });
+        }
+
+        tokenPromise()
+            .then(function (token) {
+                return fetch('/backend-api/conversation/' + encodeURIComponent(id), {
+                    credentials: 'include',
+                    headers: { Authorization: 'Bearer ' + token }
+                }).then(function (res) {
+                    if (res.status === 401 || res.status === 403) {
+                        _cgptAccessToken = null;
+                        _cgptAccessTokenAt = 0;
+                    }
+                    if (!res.ok) throw new Error('conversation HTTP ' + res.status);
+                    return res.json();
+                });
+            })
+            .then(function (data) {
+                if (seq !== _cgptIndexRequestSeq || id !== _cgptConversationId()) return;
+                var questions = _cgptBuildQuestions(data);
+                if (!questions.length) throw new Error('conversation had no visible user prompts');
+                _cgptIndexConversationId = id;
+                _cgptIndexQuestions = questions;
+                _cgptIndexStatus = 'ready';
+            })
+            .catch(function (err) {
+                if (seq !== _cgptIndexRequestSeq) return;
+                _cgptIndexConversationId = id;
+                _cgptIndexQuestions = [];
+                _cgptIndexStatus = 'degraded';
+                console.warn('[ACN ChatGPT] full-history index unavailable; using DOM harvest:', err);
+            })
+            .then(function () {
+                if (seq !== _cgptIndexRequestSeq) return;
+                _cgptIndexInFlight = false;
+                scanConversation(true);
+            });
+    }
+
+    function _cgptShellForQuestion(q) {
+        if (q && q.shell && q.shell.isConnected) return q.shell;
+        if (q && typeof q.vsIndex === 'number' && isFinite(q.vsIndex)) {
+            return document.querySelector('[data-testid="conversation-turn-' + q.vsIndex + '"]');
+        }
+        return null;
+    }
+
+    // Virtual-scroll helpers. Platforms may provide stable identity/order hooks;
+    // otherwise retain the old text/data-index fallback for existing adapters.
+    function _vsMessageKey(msg, text) {
+        if (platform && typeof platform.getMessageKey === 'function') {
+            var stable = platform.getMessageKey(msg);
+            if (stable) return platform.id + '|' + stable;
+        }
+        return _normalizeKey(text);
+    }
+
+    function _vsMessageIndex(msg, fallback) {
+        if (platform && typeof platform.getVirtualIndex === 'function') {
+            var idx = platform.getVirtualIndex(msg);
+            if (typeof idx === 'number' && isFinite(idx)) return idx;
+        }
+        var virtuosoItem = msg && msg.closest ? msg.closest('[data-index]') : null;
+        if (virtuosoItem) {
+            var parsed = parseInt(virtuosoItem.getAttribute('data-index'), 10);
+            if (isFinite(parsed)) return parsed;
+        }
+        return fallback;
+    }
+
     function scanConversation(forceReset) {
+        // ── ChatGPT: API-backed prompt index + live DOM binding ───────────
+        if (platform.id === 'chatgpt') {
+            var cgptId = _cgptConversationId();
+            if (cgptId) {
+                _cgptEnsureIndex(false);
+                if (_cgptIndexStatus === 'ready' &&
+                    _cgptIndexConversationId === cgptId &&
+                    _cgptIndexQuestions.length) {
+                    _questions = _cgptBindMountedAndMerge(_cgptIndexQuestions);
+                    _aiResponses = Array.from(getAIMessages());
+                    if (typeof injectBookmarkIcons === 'function') injectBookmarkIcons();
+                    if (typeof orbOnScanComplete === 'function') orbOnScanComplete();
+                    return;
+                }
+            } else if (_cgptIndexConversationId) {
+                _cgptResetIndex();
+            }
+        }
+
         // ── Claude: index-backed path ────────────────────────────
         // The DOM holds ~3% of a long conversation, so it cannot be the source of
         // truth. When the index is available it wins; the DOM scan below stays as
@@ -4301,14 +4648,17 @@
             messages.forEach(function (msg) {
                 var text = _readMessageText(msg);
                 if (!text.trim()) return;
-                var key = _normalizeKey(text);
+                var key = _vsMessageKey(msg, text);
                 if (!_vsAccumulatedKeys.has(key)) {
                     _vsAccumulatedKeys.add(key);
-                    var virtuosoItem = msg.closest('[data-index]');
-                    var vsIndex = virtuosoItem
-                        ? parseInt(virtuosoItem.getAttribute('data-index'), 10)
-                        : _questions.length;
-                    _questions.push({ element: msg, text: text, summary: generateSummary(text), vsIndex: vsIndex });
+                    var vsIndex = _vsMessageIndex(msg, _questions.length);
+                    _questions.push({
+                        element: msg,
+                        text: text,
+                        summary: generateSummary(text),
+                        vsIndex: vsIndex,
+                        messageKey: key
+                    });
                     addedNew = true;
                 }
             });
@@ -4323,13 +4673,16 @@
                     var text = _readMessageText(msg);
                     if (!text.trim()) return;
                     if (isVirtualScroll) {
-                        var key = _normalizeKey(text);
+                        var key = _vsMessageKey(msg, text);
                         _vsAccumulatedKeys.add(key);
-                        var virtuosoItem = msg.closest('[data-index]');
-                        var vsIndex = virtuosoItem
-                            ? parseInt(virtuosoItem.getAttribute('data-index'), 10)
-                            : _questions.length;
-                        _questions.push({ element: msg, text: text, summary: generateSummary(text), vsIndex: vsIndex });
+                        var vsIndex = _vsMessageIndex(msg, _questions.length);
+                        _questions.push({
+                            element: msg,
+                            text: text,
+                            summary: generateSummary(text),
+                            vsIndex: vsIndex,
+                            messageKey: key
+                        });
                     } else {
                         _questions.push({ element: msg, text: text, summary: generateSummary(text) });
                     }
@@ -5860,8 +6213,16 @@
         }
 
         if (stat) {
-            stat.textContent = _questions.length + ' question' +
-                (_questions.length !== 1 ? 's' : '') + ' detected';
+            if (platform.id === 'chatgpt' && isVirtualScroll) {
+                stat.textContent = _questions.length + ' question' +
+                    (_questions.length !== 1 ? 's' : '') +
+                    (_cgptIndexStatus === 'ready'
+                        ? ' indexed from full conversation'
+                        : ' indexed · scroll to discover older turns');
+            } else {
+                stat.textContent = _questions.length + ' question' +
+                    (_questions.length !== 1 ? 's' : '') + ' detected';
+            }
             stat.setAttribute('data-acn-count', String(_questions.length));
         }
 
@@ -6316,16 +6677,120 @@
         // the same DOM node for a different message, so a still-connected node can be
         // displaying different content — the same trap the bookmark-icon guard
         // documents. Re-validate the text before trusting the cached reference.
-        if (q.element && q.element.isConnected &&
-            _normalizeKey(_readMessageText(q.element)) === _normalizeKey(q.text)) {
-            return q.element;
+        if (q.element && q.element.isConnected) {
+            var liveText = _readMessageText(q.element);
+            if (q.messageKey) {
+                if (_vsMessageKey(q.element, liveText) === q.messageKey) return q.element;
+            } else if (_normalizeKey(liveText) === _normalizeKey(q.text)) {
+                return q.element;
+            }
         }
         var wanted  = _normalizeKey(q.text);
         var current = Array.from(getUserMessages());
         for (var i = 0; i < current.length; i++) {
-            if (_normalizeKey(_readMessageText(current[i])) === wanted) return current[i];
+            var currentText = _readMessageText(current[i]);
+            if (q.messageKey) {
+                if (_vsMessageKey(current[i], currentText) === q.messageKey) return current[i];
+            } else if (_normalizeKey(currentText) === wanted) {
+                return current[i];
+            }
         }
         return null;
+    }
+
+    // ChatGPT 2026 virtualizes the timeline and uses a column-reverse scroll
+    // container. A stored q.element therefore goes stale as soon as its turn leaves
+    // the mount window. Page toward the target's stable conversation-turn-N until
+    // the virtualizer mounts it again, then use the normal verified fast path.
+    var _chatgptJumpToken = 0;
+
+    function _chatgptJumpToVirtualQuestion(q, done) {
+        var scroller = platform && typeof platform.getScrollContainer === 'function'
+            ? platform.getScrollContainer()
+            : null;
+        if (!scroller || typeof q.vsIndex !== 'number' || !isFinite(q.vsIndex)) {
+            done(false, null, 'unavailable');
+            return;
+        }
+
+        var token = ++_chatgptJumpToken;
+        var attempts = 0;
+        var stalled = 0;
+        var maxAttempts = 24;
+        var shell = _cgptShellForQuestion(q);
+        orbSetJumpBusy(true);
+
+        // Persistent turn shells are the stable coarse target even while their
+        // inner message content is virtualized away.
+        if (shell) {
+            try { shell.scrollIntoView({ behavior: 'auto', block: 'center' }); } catch (e) {}
+        }
+
+        function finish(ok, el, reason) {
+            if (token !== _chatgptJumpToken) return;
+            orbSetJumpBusy(false);
+            done(ok, el || null, reason || null);
+        }
+
+        function tick() {
+            if (token !== _chatgptJumpToken) return;
+
+            var hit = _relocateQuestionElement(q);
+            if (hit) {
+                finish(true, hit, null);
+                return;
+            }
+            if (attempts++ >= maxAttempts) {
+                if (shell && shell.isConnected) finish(true, shell, 'shell');
+                else finish(false, null, 'not-found');
+                return;
+            }
+
+            var mounted = Array.from(getUserMessages());
+            var indices = [];
+            for (var i = 0; i < mounted.length; i++) {
+                var vi = _vsMessageIndex(mounted[i], null);
+                if (typeof vi === 'number' && isFinite(vi)) indices.push(vi);
+            }
+
+            var viewport = Math.max(scroller.clientHeight || 0, 600);
+            var step = viewport * 0.9;
+            var direction = -1; // older / visually upward
+
+            if (indices.length) {
+                var minIdx = Math.min.apply(Math, indices);
+                var maxIdx = Math.max.apply(Math, indices);
+                var gap;
+                if (q.vsIndex < minIdx) {
+                    direction = -1;
+                    gap = minIdx - q.vsIndex;
+                } else if (q.vsIndex > maxIdx) {
+                    direction = 1;
+                    gap = q.vsIndex - maxIdx;
+                } else {
+                    direction = q.vsIndex < (minIdx + maxIdx) / 2 ? -1 : 1;
+                    gap = 1;
+                }
+                step *= Math.max(1, Math.min(4, gap / 4));
+            }
+
+            var before = scroller.scrollTop;
+            scroller.scrollTop = before + direction * step;
+            var after = scroller.scrollTop;
+            if (Math.abs(after - before) < 1) stalled++;
+            else stalled = 0;
+
+            if (stalled >= 4) {
+                if (shell && shell.isConnected) finish(true, shell, 'shell');
+                else finish(false, null, 'boundary');
+                return;
+            }
+
+            // ChatGPT's virtualizer commits the new mount window asynchronously.
+            setTimeout(tick, 120);
+        }
+
+        tick();
     }
 
     function orbScrollToQuestion(q) {
@@ -6342,6 +6807,33 @@
         // here and keep the plain behaviour — the seam stays clean for the
         // cross-platform audit to add platforms later.
         if (!target) {
+            // ChatGPT now virtualizes its conversation timeline. Unlike Claude we
+            // do not have an API-backed full tree here, but every harvested turn
+            // carries a stable conversation-turn-N ordinal, so page the virtualizer
+            // until that exact turn remounts.
+            if (platform.id === 'chatgpt' && isVirtualScroll &&
+                typeof q.vsIndex === 'number' && isFinite(q.vsIndex)) {
+                _chatgptJumpToVirtualQuestion(q, function (ok, el, reason) {
+                    if (ok && el) {
+                        if (reason !== 'shell') q.element = el;
+                        orbMarkJumpTarget(el);
+                        if (reason !== 'shell') {
+                            el.scrollIntoView({
+                                behavior: _prefersReducedMotion() ? 'auto' : 'smooth',
+                                block: 'center'
+                            });
+                        }
+                        orbFlashElement(el);
+                        if (reason === 'shell') {
+                            showToast('Moved to that turn — nudge the wheel if ChatGPT has not mounted its content yet');
+                        }
+                    } else if (reason !== 'superseded') {
+                        showToast('That message could not be remounted — scroll toward it and try again');
+                    }
+                });
+                return;
+            }
+
             // pathIndex must be a REAL position in the active path. Provisional
             // entries (DOM-merged, not yet in the index) carry MAX_SAFE_INTEGER as
             // a sort key — jumping to that would burn all 8 iterations chasing a
