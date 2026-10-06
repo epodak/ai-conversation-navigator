@@ -3704,6 +3704,8 @@
     var _cgptIndexQuestions = [];
     var _cgptIndexInFlight = false;
     var _cgptIndexRequestSeq = 0;
+    var _cgptIndexFailedAt = 0;
+    var _cgptRefreshTimer = null;
     var _cgptAccessToken = null;
     var _cgptAccessTokenAt = 0;
     var _navListFingerprint    = ''; // used to skip DOM rebuild when questions are unchanged
@@ -4240,13 +4242,21 @@
         _cgptIndexConversationId = null;
         _cgptIndexQuestions = [];
         _cgptIndexInFlight = false;
+        _cgptIndexFailedAt = 0;
+        if (_cgptRefreshTimer) {
+            clearTimeout(_cgptRefreshTimer);
+            _cgptRefreshTimer = null;
+        }
         _cgptIndexRequestSeq++;
     }
 
     function _cgptUserShells() {
         return Array.from(document.querySelectorAll(
-            '[data-testid^="conversation-turn-"][data-turn="user"]'
-        ));
+            '[data-testid^="conversation-turn-"][data-turn="user"], ' +
+            '[data-turn-key][data-turn="user"]'
+        )).filter(function (el, idx, arr) {
+            return arr.indexOf(el) === idx;
+        });
     }
 
     function _cgptTurnIndexFromShell(shell, fallback) {
@@ -4308,6 +4318,7 @@
                 vsIndex: idx,
                 messageKey: key,
                 messageId: apiUsers[i].id,
+                userOrdinal: i,
                 apiBacked: true
             });
         }
@@ -4324,6 +4335,7 @@
                 vsIndex: q.vsIndex,
                 messageKey: q.messageKey,
                 messageId: q.messageId,
+                userOrdinal: q.userOrdinal,
                 apiBacked: true
             };
         });
@@ -4362,10 +4374,26 @@
                 vsIndex: idx,
                 messageKey: key,
                 messageId: null,
+                userOrdinal: questions.length,
                 apiBacked: false
             };
             questions.push(liveQ);
             byKey[key] = liveQ;
+
+            // Keep a just-sent prompt after it scrolls out of the mounted window,
+            // even if the conversation endpoint has not caught up yet.
+            indexed.push({
+                element: mounted[j],
+                shell: liveQ.shell,
+                text: liveQ.text,
+                summary: liveQ.summary,
+                vsIndex: liveQ.vsIndex,
+                messageKey: liveQ.messageKey,
+                messageId: null,
+                userOrdinal: liveQ.userOrdinal,
+                apiBacked: false
+            });
+            _cgptScheduleRefresh();
         }
 
         questions.sort(function (a, b) {
@@ -4373,6 +4401,14 @@
                    (typeof b.vsIndex === 'number' ? b.vsIndex : 0);
         });
         return questions;
+    }
+
+    function _cgptScheduleRefresh() {
+        if (_cgptRefreshTimer) return;
+        _cgptRefreshTimer = setTimeout(function () {
+            _cgptRefreshTimer = null;
+            _cgptEnsureIndex(true);
+        }, 1500);
     }
 
     function _cgptEnsureIndex(force) {
@@ -4383,6 +4419,9 @@
             _cgptResetIndex();
         }
         if (!force && _cgptIndexStatus === 'ready' && _cgptIndexConversationId === id) return;
+        if (!force && _cgptIndexStatus === 'degraded' &&
+            _cgptIndexConversationId === id &&
+            Date.now() - _cgptIndexFailedAt < 60 * 1000) return;
         if (_cgptIndexInFlight) return;
 
         _cgptIndexInFlight = true;
@@ -4427,25 +4466,38 @@
                 _cgptIndexConversationId = id;
                 _cgptIndexQuestions = questions;
                 _cgptIndexStatus = 'ready';
+                _cgptIndexFailedAt = 0;
             })
             .catch(function (err) {
                 if (seq !== _cgptIndexRequestSeq) return;
                 _cgptIndexConversationId = id;
                 _cgptIndexQuestions = [];
                 _cgptIndexStatus = 'degraded';
+                _cgptIndexFailedAt = Date.now();
                 console.warn('[ACN ChatGPT] full-history index unavailable; using DOM harvest:', err);
             })
             .then(function () {
                 if (seq !== _cgptIndexRequestSeq) return;
                 _cgptIndexInFlight = false;
-                scanConversation(true);
+                // Preserve generic virtual-scroll harvest on API failure; the ready
+                // branch ignores this flag and will replace it with the full index.
+                scanConversation(false);
             });
     }
 
     function _cgptShellForQuestion(q) {
         if (q && q.shell && q.shell.isConnected) return q.shell;
         if (q && typeof q.vsIndex === 'number' && isFinite(q.vsIndex)) {
-            return document.querySelector('[data-testid="conversation-turn-' + q.vsIndex + '"]');
+            var byTestId = document.querySelector(
+                '[data-testid="conversation-turn-' + q.vsIndex + '"]'
+            );
+            if (byTestId) return byTestId;
+        }
+        if (q && typeof q.userOrdinal === 'number') {
+            var shells = _cgptUserShells();
+            if (q.userOrdinal >= 0 && q.userOrdinal < shells.length) {
+                return shells[q.userOrdinal];
+            }
         }
         return null;
     }

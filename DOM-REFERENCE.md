@@ -2,7 +2,7 @@
 
 This document records the **real DOM structure** of user messages on each supported platform, the selectors we chose, and the debugging history that led to each choice. This prevents context loss across sessions.
 
-Last updated: Jul 29, 2026 (v12.1 — Probe E added: the conversation payload's thinking-block shape. Claude's DOM was fully re-inspected Jul 26, 2026 for v12.0; the other 13 platforms were last verified Feb 18, 2026 and have NOT been re-checked since)
+Last updated: Oct 6, 2026 (v12.9 — ChatGPT virtualization/current-rollout repair. Claude was fully re-inspected Jul 26, 2026; ChatGPT was re-checked against current public live-verification evidence Sep 30–Oct 6, 2026; the remaining platforms retain their earlier dates)
 
 > ⚠️ **Staleness warning.** Claude's selectors drifted substantially between Feb and Jul 2026 without anyone noticing, because the fallback chains absorbed it and the mock-based test suite stayed green. Assume the other 13 entries carry the same risk until re-inspected.
 
@@ -42,7 +42,8 @@ follow — virtualization is the standard fix for a slow chat page, not a Claude
 | **Claude** (`claude.ai/chat`) | **YES — Virtuoso-style recycling**, ~3–7 of N turns mounted | Jul 26, 2026 | **API-backed conversation index** (DEC-021). DOM is the labelled fallback. |
 | **Emergent** (`app.emergent.sh`) | **YES — Virtuoso recycling**, `[data-testid="virtuoso-scroller"]` | Feb 15, 2026 | **Accumulation only** — scans keep messages the user has already scrolled past, plus click-time re-resolution of stale references. **Nothing sweeps.** See the ⚠️ below. |
 | **Gemini** | **NO recycling at n≤10 — measured**; unresolved at 100+ | Jul 30, 2026 | DOM. Measured live (Chromium, page realm, owner's account, visible tab, 10-turn conversation — the longest available): all 10 turns mounted at top/middle/bottom scroll positions, held references stayed `isConnected` with text intact; zero `cdk-virtual-scroll-viewport` nodes. Owner's Firefox observation at n≈10–20 corroborates. `docs/CONTEXT-TRACKING.md` / `docs/BOOKMARKS.md` claims that "only viewport messages exist in DOM" are **contradicted at this scale** — but the scroller is literally `<infinite-scroller class="chat-history">`, so lazy-loading at 100+ turns remains possible and unmeasured. No conversation that long exists on the test account. |
-| ChatGPT · Grok · Perplexity | not observed | Feb 18, 2026 | DOM |
+| **ChatGPT** | **YES — persistent turn shells + virtualized inner content** | Oct 6, 2026 | **Same-origin conversation JSON prompt index + live DOM binding + shell-first jump** |
+| Grok · Perplexity | not observed | Feb 18, 2026 | DOM |
 | Claude Code Web · Codex Web | not observed | Feb 18, 2026 | DOM |
 | Bolt · Lovable · Replit · V0 · Base44 · Firebase Studio | not observed | Feb 18, 2026 | DOM |
 
@@ -355,36 +356,98 @@ AI messages use `items-start` (left-aligned), no `bg-bg-300`, `data-testid="assi
 
 ## ChatGPT
 
-**Inspected:** Feb 16, 2026 (live site)
-**Selector:** `[data-message-author-role]` filtered by value `=== 'user'`
+**Updated:** Oct 6, 2026  
+**Primary user selector:** `[data-message-author-role="user"]`  
+**Current rollout fallback:** `[data-chatgpt-search-unit-key$=":user"]`  
+**Persistent turn shell:** `[data-testid^="conversation-turn-"][data-turn="user"]`  
+**Primary scroll container:** `[data-app-action-timeline-scroll]`
 
-### Real DOM Structure (A→K nesting)
+> **v12.9 correction:** the February entry below treated the DOM as a complete conversation and
+> hard-coded an `article` turn wrapper. Both assumptions are now unsafe. Current ChatGPT can keep
+> only the near-viewport message bodies mounted while retaining lightweight turn shells, and current
+> rollouts may use `section[data-testid="conversation-turn-N"]` or `data-turn-key` rather than the
+> old article shape.
+
+### Current model (Oct 2026)
+
+There are now three distinct identities. Keep them separate:
+
+| Layer | Current signal | What ACN uses it for |
+|---|---|---|
+| Conversation truth | `GET /backend-api/conversation/<id>` (Bearer token from same-origin `/api/auth/session`) | Complete ordered prompt list for the selected branch |
+| Persistent turn shell | `[data-testid^="conversation-turn-"][data-turn]`, with `data-turn-key` fallback | Stable coarse jump target and turn ordering |
+| Mounted message body | legacy `data-message-author-role` / `data-message-id`, or rollout `data-chatgpt-search-unit-key` / `data-chatgpt-search-message-ids` | Live text authority, exact message binding, highlight |
+
+The conversation endpoint returns a tree because edits/regenerations create branches. v12.9 walks
+backward from `current_node`, reverses that parent chain, and keeps only visible user messages
+(`recipient === "all"`, not `is_visually_hidden_from_conversation`). This is a **read-only
+same-origin hint/index**. Mounted DOM text remains authoritative for prompts that are currently
+visible, especially after edits.
+
+This means Navigate no longer depends on the user manually scrolling through every old turn before
+the list becomes complete. If the same-origin fetch fails (logged out, endpoint/rollout drift,
+permission change), ACN degrades to accumulated DOM harvesting rather than rendering an empty panel.
+Failed prefetches have a cooldown; a just-sent live prompt is retained immediately and triggers a
+later refresh so it does not disappear when its DOM body is recycled.
+
+### Virtualization and scrolling
+
+Current ChatGPT can use a reverse-coordinate timeline where the visual bottom is near
+`scrollTop === 0` and older content is reached with increasingly negative values. It also
+virtualizes message bodies. Therefore:
+
+- never interpret `scrollTop === 0` as "top" without first identifying the actual container/layout;
+- never cache a message element as permanent identity;
+- key prompts by message/turn identity, not normalized prompt text (duplicate "continue" prompts are valid);
+- use the persistent turn shell as the first jump target, then bind/flash the exact body after it remounts;
+- if ChatGPT does not mount the inner content after a programmatic jump, the shell landing is still valid
+  and the UI asks for one real wheel nudge rather than pretending the exact body was reached.
+
+### DOM rollout compatibility
+
+The adapter intentionally accepts both families:
+
+```js
+// Legacy / still observed
+[data-message-author-role="user"][data-message-id]
+[data-message-author-role="assistant"][data-message-id]
+
+// Newer rollout
+[data-chatgpt-search-unit-key$=":user"][data-chatgpt-search-message-ids]
+[data-chatgpt-search-unit-key$=":assistant"][data-chatgpt-search-message-ids]
+
+// Turn wrapper — do NOT hard-code <article>
+[data-testid^="conversation-turn-"], [data-turn-key]
+```
+
+Recent independent live-verification work (Sep 30, 2026) reports both the legacy attributes and the
+`data-chatgpt-search-*` rollout in active use. Another current navigator reports persistent
+`section[data-testid="conversation-turn-N"]` shells while the inner content is virtualized. Those
+two facts are why v12.9 uses capability/fallback detection rather than a single frozen DOM chart.
+
+### February 2026 legacy snapshot
+
+The previous live snapshot used:
 
 ```
-A: article[data-testid="conversation-turn-N"][data-turn="user"][data-turn-id="{uuid}"][data-scroll-anchor="false"]  (turn wrapper)
-  B: h5.sr-only  "You said:"
-  C: div.text-base.my-auto.mx-auto.pt-12
-    D: div[--thread-content-max-width:48rem].relative.flex.w-full.min-w-0.flex-col
-      E: div.flex.max-w-full.flex-col.group
-        F: div.min-h-8.text-message.relative.flex.w-full.flex-col.items-end[data-message-author-role="user"][data-message-id="{uuid}"]  (OUR TARGET)
-          G: div.flex.w-full.flex-col.gap-1.empty:hidden.items-end
-            H: div.user-message-bubble-color.corner-superellipse.relative.max-w-[var(--user-chat-width,70%)]  (bubble)
-              I: div.whitespace-pre-wrap
-                J: div  (text content)
-          K: div.z-0.flex.justify-end  (action buttons)
-  L: span.sr-only  (screen reader content)
+article[data-testid="conversation-turn-N"][data-turn="user"]
+  div[data-message-author-role="user"][data-message-id="{uuid}"]
+    div.user-message-bubble-color
+      div.whitespace-pre-wrap
 ```
 
-AI messages use `article[data-turn="assistant"]`, `data-message-author-role="assistant"`, `items-start`, `h5.sr-only "ChatGPT said:"`.
-
-### Notes
-- `data-message-author-role` has values `"user"`, `"assistant"`, `"system"`
-- Both ChatGPT Chat and Codex Web share the same hostname (`chatgpt.com`), differentiated by path
-- User bubble has `.user-message-bubble-color.corner-superellipse` (superellipse border shape)
-- `article` elements wrap each conversation turn with sequential `data-testid="conversation-turn-N"`
+That snapshot remains useful for the legacy path, but `article` is no longer an invariant. A July
+2026 regression report measured zero matching `article[data-testid^="conversation-turn"]` nodes
+while `[data-message-author-role="assistant"]` still matched, demonstrating exactly why wrapper
+tag names must not be part of identity.
 
 ### Debugging History
-- v7.7 (Feb 16, 2026): Rebuilt mock from live DevTools screenshot. Real structure uses article turn wrappers, sr-only headings, thread-content-max-width CSS variables, superellipse bubble corners, and items-end alignment.
+
+- **v12.9 (Oct 6, 2026):** Reclassified ChatGPT as virtualized/SPA-aware; added stable message/turn
+  identity, full-conversation read-only prompt indexing, current rollout selectors, persistent shell
+  jumps, reverse-scroll handling, degraded fallback, and a dedicated virtualization regression probe.
+- **v7.7 (Feb 16, 2026):** Rebuilt the then-current mock from a live DevTools screenshot; this is now
+  the legacy snapshot above.
 
 ---
 
