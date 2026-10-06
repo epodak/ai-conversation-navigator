@@ -12334,6 +12334,10 @@
             orbScrollInverted = false;
             orbMiniRailVisible = true;
             _miniRailSetVisible(true, false);
+            if (typeof railToggle !== 'undefined' && railToggle) {
+                railToggle.classList.add('acn-on');
+                railToggle.setAttribute('aria-checked', 'true');
+            }
             orbSaveSettings();
 
             var fresh = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
