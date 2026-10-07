@@ -4448,6 +4448,7 @@
             if (questions[i].messageKey) byKey[questions[i].messageKey] = questions[i];
         }
 
+        var liveAdded = false;
         mounted.forEach(function (el) {
             var text = _readMessageText(el);
             if (!text) return;
@@ -4484,8 +4485,11 @@
                 routeEpoch: currentEpoch
             };
             questions.push(live);
+            liveAdded = true;
             if (key) byKey[key] = live;
         });
+
+        if (liveAdded) _cgptScheduleRefresh();
 
         questions.sort(function (a, b) {
             return (typeof a.vsIndex === 'number' ? a.vsIndex : 0) -
@@ -4568,6 +4572,13 @@
         _aiResponses = Array.from(getAIMessages());
         if (typeof injectBookmarkIcons === 'function') injectBookmarkIcons();
         if (typeof orbOnScanComplete === 'function') orbOnScanComplete();
+
+        // If Navigate/Search stayed open across an SPA switch, request the new route's
+        // full history only after its DOM is already usable.
+        if ((orbPanel === 'nav' || orbPanel === 'search') &&
+            _cgptIndexStatus === 'idle') {
+            setTimeout(function () { _cgptRequestFullIndex(false); }, 0);
+        }
     }
 
     function _cgptScheduleRefresh() {
