@@ -153,6 +153,13 @@ function fail(msg, detail) {
   }
   if (result.count !== TOTAL) fail('jump must retain the full API index', JSON.stringify(result));
 
+  // Hold a detached clickable object from the FIRST A lifecycle. After A -> B -> A,
+  // conversation id alone would make this stale closure look current again; routeEpoch
+  // must reject it.
+  await page.evaluate(() => {
+    window.__oldANavItem = document.querySelector('[data-acn-role="nav-item"]');
+  });
+
   // SPA route switch regression: bypass ACN's patched history methods by using the
   // native pushState captured by the mock before the userscript was injected.
   //
@@ -271,9 +278,62 @@ function fail(msg, detail) {
     fail('conversation B navigator should contain only B prompts', JSON.stringify(switched));
   }
 
+  // A -> B -> A generation test. Keep B DOM mounted while the URL/API returns to A.
+  await page.evaluate(firstId => {
+    window.__probe.nativePushState({}, '', '/c/' + firstId);
+  }, CONVO_ID);
+
+  await page.waitForFunction(() => {
+    var panel = document.querySelector('[data-acn-role="nav-panel"]');
+    return location.pathname.indexOf('11111111-1111-4111-8111-111111111111') !== -1 &&
+      (!panel || panel.getAttribute('data-acn-open') !== 'true');
+  }, null, { timeout: 3000 });
+
+  await page.click('[data-acn-role="nav-trigger"]');
+  await page.waitForSelector('[data-acn-role="nav-panel"][data-acn-open="true"]', { timeout: 3000 });
+
+  await page.waitForFunction(total => {
+    var stat = document.querySelector('[data-acn-role="nav-stat"]');
+    var items = Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'));
+    return stat && Number(stat.getAttribute('data-acn-count')) === total &&
+      items.length === total &&
+      items.every(function(el){
+        return /^Question number \d+ about virtual scrolling$/.test((el.textContent || '').trim());
+      });
+  }, TOTAL, { timeout: 10000 });
+
+  // Click the DETACHED nav item captured from A epoch #1. Current id is A again, so
+  // conversation-id-only isolation would incorrectly accept it. The epoch guard must
+  // refuse it and emit the stale-conversation toast.
+  await page.evaluate(() => {
+    if (window.__oldANavItem) window.__oldANavItem.click();
+  });
+
+  await page.waitForFunction(() => {
+    var toast = document.getElementById('acn-toast');
+    return toast && /Conversation changed/.test(toast.textContent || '');
+  }, null, { timeout: 2000 }).catch(() => {});
+
+  const aba = await page.evaluate(() => {
+    var toast = document.getElementById('acn-toast');
+    var target = document.querySelector('[data-acn-jump-target="true"]');
+    return {
+      toast: toast ? (toast.textContent || '').trim() : null,
+      target: target ? (target.textContent || '').trim() : null,
+      path: location.pathname
+    };
+  });
+
+  if (!aba.toast || aba.toast.indexOf('Conversation changed') === -1) {
+    fail('stale A epoch closure was not rejected after A -> B -> A', JSON.stringify(aba));
+  }
+  if (aba.target) {
+    fail('stale A epoch closure produced a jump target after A -> B -> A', JSON.stringify(aba));
+  }
+
   if (!process.exitCode) {
     console.log('PASS: ChatGPT virtualization + strict SPA conversation lifecycle isolation');
-    console.log(JSON.stringify({ initial: result, transition, switched }));
+    console.log(JSON.stringify({ initial: result, transition, apiReadyWhileOldDom, switched, aba }));
   }
 
   await browser.close();
