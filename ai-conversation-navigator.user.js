@@ -3719,6 +3719,9 @@
     // API index. While true, DOM fallback is forbidden because ChatGPT may still be
     // displaying the previous conversation's recycled rows.
     var _cgptRouteTransition = false;
+    // Set only after at least one mounted message id is proven to belong to the
+    // current API snapshot. DOM-derived features are quarantined until then.
+    var _cgptDomVerifiedEpoch = -1;
     var _cgptAccessToken = null;
     var _cgptAccessTokenAt = 0;
     var _navListFingerprint    = ''; // used to skip DOM rebuild when questions are unchanged
@@ -4281,14 +4284,26 @@
         // Any jump started by the previous conversation must become inert immediately.
         // Incrementing the token cancels its settle loop; clearing busy state prevents
         // the superseded loop from leaving the new conversation's panel disabled.
-        try { _chatgptJumpToken++; } catch (e) {}
+        if (typeof _chatgptJumpToken === 'number') _chatgptJumpToken++;
         try { orbSetJumpBusy(false); } catch (e) {}
 
-        // Remove purely visual state attached to DOM nodes that may survive the route
-        // transition for a few hundred milliseconds.
+        _cgptDomVerifiedEpoch = -1;
+
+        // Remove conversation-scoped UI state attached to DOM nodes that React may
+        // keep alive/recycle across the route boundary.
         try {
             document.querySelectorAll('[data-acn-jump-target="true"]').forEach(function (el) {
                 el.removeAttribute('data-acn-jump-target');
+            });
+            document.querySelectorAll('[data-acn-bookmark]').forEach(function (el) {
+                if (el.parentNode) el.parentNode.removeChild(el);
+            });
+            document.querySelectorAll('[data-acn-bookmarked]').forEach(function (el) {
+                el.removeAttribute('data-acn-bookmarked');
+            });
+            ['acn-nav-list', 'acn-search-list'].forEach(function (id) {
+                var list = document.getElementById(id);
+                if (list) while (list.firstChild) list.removeChild(list.firstChild);
             });
         } catch (e) {}
 
@@ -4497,6 +4512,7 @@
         // If B's DOM is already identity-verified and an unknown row is beyond the
         // snapshot's max turn index, schedule a refresh and wait for the API to own it.
         if (verifiedCurrentDom) {
+            _cgptDomVerifiedEpoch = currentEpoch;
             for (var k = 0; k < mounted.length; k++) {
                 var t2 = _readMessageText(mounted[k]);
                 if (!t2) continue;
@@ -4686,7 +4702,12 @@
                     // Do not source assistant state from mounted DOM here. During a route
                     // transition that DOM can still be A even though the URL/index are B.
                     _aiResponses = [];
-                    if (typeof injectBookmarkIcons === 'function') injectBookmarkIcons();
+                    // Bookmark injection is DOM-derived. Only touch the page after at
+                    // least one mounted B message id has matched the B API snapshot.
+                    if (_cgptDomVerifiedEpoch === _cgptRouteEpoch &&
+                        typeof injectBookmarkIcons === 'function') {
+                        injectBookmarkIcons();
+                    }
                     if (typeof orbOnScanComplete === 'function') orbOnScanComplete();
                     return;
                 }
@@ -7478,7 +7499,8 @@
                 }
             }
             var sfp = q + '|' + _questions.length + '|' + (_aiResponses ? _aiResponses.length : 0) +
-                      '|g' + _ciIndexGen + '|L' + liveLen;
+                      '|g' + _ciIndexGen + '|L' + liveLen +
+                      '|cg:' + _cgptIndexStatus + ':e' + _cgptRouteEpoch;
             if (sfp === _searchListFingerprint && list.firstChild) return;
             _searchListFingerprint = sfp;
         }
@@ -10319,7 +10341,11 @@
                               type: 'ai' });
             }
         } else {
-            aiMsgs = Array.from(getAIMessages()).map(function (el) {
+            var safeAiEls = (platform.id === 'chatgpt' &&
+                              _cgptDomVerifiedEpoch !== _cgptRouteEpoch)
+                ? []
+                : Array.from(getAIMessages());
+            aiMsgs = safeAiEls.map(function (el) {
                 return { element: el, text: _readAIText(el), type: 'ai' };
             });
         }
@@ -11024,6 +11050,9 @@
     function getConversationImages() {
         var allImages = [];
         if (typeof platform === 'undefined' || !platform) return allImages;
+        if (platform.id === 'chatgpt' && _cgptDomVerifiedEpoch !== _cgptRouteEpoch) {
+            return allImages;
+        }
 
         // imageSelector: null  → platform explicitly unsupported (e.g. Perplexity)
         // imageSelector: string → use as querySelectorAll argument within each message context
@@ -11622,6 +11651,11 @@
     }
 
     function exportFullConversation() {
+        if (platform.id === 'chatgpt' && _cgptDomVerifiedEpoch !== _cgptRouteEpoch) {
+            showToast('This conversation is still switching — export is temporarily unavailable');
+            return;
+        }
+
         try {
         // Prefer the complete index; fall back to the DOM scan, which on a
         // virtualized platform can only see what is mounted.
