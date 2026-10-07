@@ -9,6 +9,7 @@ const ROOT = path.resolve(__dirname, '..');
 const USERSCRIPT = fs.readFileSync(path.join(ROOT, 'ai-conversation-navigator.user.js'), 'utf8');
 const CONVO_ID = '11111111-1111-4111-8111-111111111111';
 const SECOND_CONVO_ID = '22222222-2222-4222-8222-222222222222';
+const THIRD_CONVO_ID = '33333333-3333-4333-8333-333333333333';
 const TOTAL = 24;
 const WINDOW = 4;
 const html = "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>ChatGPT virtualized timeline probe</title>\n<style>\nhtml,body{margin:0;height:100%;background:#212121;color:#eee}\n#timeline{height:620px;overflow-y:auto;display:flex;flex-direction:column-reverse;border:1px solid #444}\n#spacer{height:2880px;flex:0 0 auto;position:relative;width:100%}\nsection[data-testid^=\"conversation-turn-\"]{position:absolute;left:0;right:0;min-height:116px;padding:8px;box-sizing:border-box}\n[data-chatgpt-search-unit-key]{min-height:40px}\n</style>\n</head>\n<body>\n<main><div data-app-action-timeline-scroll id=\"timeline\"><div id=\"spacer\"></div></div></main>\n<script>\n(function(){\n  var TOTAL=24, WINDOW=4, ROW=120;\n  var PREFIX='', ID_PREFIX='msg-user-';\n  var scroller=document.getElementById('timeline');\n  var spacer=document.getElementById('spacer');\n  var shells=[];\n  function makeShell(q){\n    var section=document.createElement('section');\n    var turnNo=q*2-1;\n    section.setAttribute('data-testid','conversation-turn-'+turnNo);\n    section.setAttribute('data-turn','user');\n    section.setAttribute('data-turn-id','msg-user-'+q);\n    section.style.top=((q-1)*ROW)+'px';\n    section.dataset.q=String(q);\n    spacer.appendChild(section);\n    return section;\n  }\n  for(var q=1;q<=TOTAL;q++) shells.push(makeShell(q));\n  function mountedBody(q){\n    var msg=document.createElement('div');\n    msg.setAttribute('data-chatgpt-search-unit-key','probe:'+ID_PREFIX+q+':user');\n    msg.setAttribute('data-chatgpt-search-message-ids',JSON.stringify([ID_PREFIX+q]));\n    msg.textContent=PREFIX+'Question number '+q+' about virtual scrolling';\n    return msg;\n  }\n  function render(){\n    var max=Math.max(1,scroller.scrollHeight-scroller.clientHeight);\n    var frac=Math.min(1,Math.abs(scroller.scrollTop)/max);\n    var newestStart=TOTAL-WINDOW;\n    var start=Math.round(newestStart*(1-frac));\n    start=Math.max(0,Math.min(newestStart,start));\n    for(var i=0;i<shells.length;i++){\n      var shell=shells[i], q=i+1;\n      var shouldMount=q>=start+1&&q<=start+WINDOW;\n      var body=shell.querySelector('[data-chatgpt-search-unit-key]');\n      if(shouldMount&&!body) shell.appendChild(mountedBody(q));\n      if(!shouldMount&&body) body.remove();\n    }\n    document.body.setAttribute('data-probe-window',String(start+1)+'-'+String(start+WINDOW));\n  }\n  scroller.addEventListener('scroll',render,{passive:true});\n  window.__probe={\n    render:render,\n    nativePushState:history.pushState.bind(history),\n    switchConversation:function(prefix,idPrefix){\n      PREFIX=prefix||'';\n      ID_PREFIX=idPrefix||'msg-user-';\n      for(var i=0;i<shells.length;i++){\n        var body=shells[i].querySelector('[data-chatgpt-search-unit-key]');\n        if(body) body.remove();\n      }\n      render();\n    },\n    mounted:function(){\n      return Array.from(document.querySelectorAll('[data-chatgpt-search-unit-key$=\":user\"]'))\n        .map(function(el){return el.textContent.trim()});\n    }\n  };\n  render();\n})();\n</script>\n</body>\n</html>";
@@ -66,6 +67,13 @@ function fail(msg, detail) {
         status: 200,
         contentType: 'application/json',
         body: JSON.stringify({ accessToken: 'probe-token' })
+      });
+    }
+    if (url.pathname === '/backend-api/conversation/' + THIRD_CONVO_ID) {
+      return route.fulfill({
+        status: 503,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'probe forces full-history API failure' })
       });
     }
     if (url.pathname === '/backend-api/conversation/' + CONVO_ID ||
@@ -278,6 +286,87 @@ function fail(msg, detail) {
     fail('conversation B navigator should contain only B prompts', JSON.stringify(switched));
   }
 
+  // Degraded API recovery: B -> C while C's full-history endpoint fails.
+  // Old B DOM must stay quarantined; a half-replaced B+C window must also stay
+  // quarantined; only a complete C window may become the DOM fallback.
+  await page.evaluate(thirdId => {
+    window.__probe.nativePushState({}, '', '/c/' + thirdId);
+  }, THIRD_CONVO_ID);
+
+  await page.waitForFunction(() => {
+    return location.pathname.indexOf('33333333-3333-4333-8333-333333333333') !== -1;
+  }, null, { timeout: 3000 });
+
+  await page.waitForTimeout(900);
+  await page.click('[data-acn-role="nav-trigger"]');
+  await page.waitForSelector('[data-acn-role="nav-panel"][data-acn-open="true"]', { timeout: 3000 });
+
+  const cOldDom = await page.evaluate(() => {
+    var items = Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'))
+      .map(function(el){ return (el.textContent || '').trim(); });
+    var banner = document.querySelector('[data-acn-index-status]');
+    return {
+      items,
+      banner: banner ? banner.getAttribute('data-acn-index-status') : null,
+      mounted: window.__probe.mounted()
+    };
+  });
+  if (cOldDom.items.some(t => t.indexOf('Second conversation: ') === 0)) {
+    fail('B DOM leaked into C after C API failure', JSON.stringify(cOldDom));
+  }
+
+  // Replace just ONE mounted row with C. Signature changed, but B identities remain,
+  // so zero-overlap gating must still refuse fallback.
+  await page.evaluate(() => {
+    var els = Array.from(document.querySelectorAll('[data-chatgpt-search-unit-key$=":user"]'));
+    var el = els[0];
+    if (!el) return;
+    var q = (el.closest('section') || {}).dataset ? (el.closest('section').dataset.q || '1') : '1';
+    el.setAttribute('data-chatgpt-search-unit-key', 'probe:msg-third-' + q + ':user');
+    el.setAttribute('data-chatgpt-search-message-ids', JSON.stringify(['msg-third-' + q]));
+    el.textContent = 'Third conversation: Question number ' + q + ' about virtual scrolling';
+  });
+  await page.waitForTimeout(800);
+
+  const cPartial = await page.evaluate(() => ({
+    items: Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'))
+      .map(function(el){ return (el.textContent || '').trim(); }),
+    mounted: window.__probe.mounted()
+  }));
+  if (cPartial.items.some(t => t.indexOf('Third conversation: ') === 0) ||
+      cPartial.items.some(t => t.indexOf('Second conversation: ') === 0)) {
+    fail('half-replaced B+C DOM must remain quarantined', JSON.stringify(cPartial));
+  }
+
+  // Now replace the entire mounted window with C. With API still failed and zero
+  // identity overlap with B, the safe DOM fallback should recover instead of bricking.
+  await page.evaluate(() => {
+    window.__probe.switchConversation('Third conversation: ', 'msg-third-');
+  });
+
+  await page.waitForFunction(() => {
+    var stat = document.querySelector('[data-acn-role="nav-stat"]');
+    var items = Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'));
+    var banner = document.querySelector('[data-acn-index-status="degraded-dom"]');
+    return stat && Number(stat.getAttribute('data-acn-count')) === 4 &&
+      items.length === 4 && banner &&
+      items.every(function(el){
+        return (el.textContent || '').indexOf('Third conversation: Question number ') === 0;
+      });
+  }, null, { timeout: 6000 });
+
+  const degradedRecovery = await page.evaluate(() => ({
+    count: Number(document.querySelector('[data-acn-role="nav-stat"]').getAttribute('data-acn-count')),
+    items: Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'))
+      .map(function(el){ return (el.textContent || '').trim(); }),
+    banner: (document.querySelector('[data-acn-index-status]') || {}).getAttribute
+      ? document.querySelector('[data-acn-index-status]').getAttribute('data-acn-index-status')
+      : null
+  }));
+  if (degradedRecovery.count !== 4 || degradedRecovery.banner !== 'degraded-dom') {
+    fail('C should recover through safe mounted-DOM fallback', JSON.stringify(degradedRecovery));
+  }
+
   // A -> B -> A generation test. Keep B DOM mounted while the URL/API returns to A.
   await page.evaluate(firstId => {
     window.__probe.nativePushState({}, '', '/c/' + firstId);
@@ -333,7 +422,7 @@ function fail(msg, detail) {
 
   if (!process.exitCode) {
     console.log('PASS: ChatGPT virtualization + strict SPA conversation lifecycle isolation');
-    console.log(JSON.stringify({ initial: result, transition, apiReadyWhileOldDom, switched, aba }));
+    console.log(JSON.stringify({ initial: result, transition, apiReadyWhileOldDom, switched, degradedRecovery, aba }));
   }
 
   await browser.close();
