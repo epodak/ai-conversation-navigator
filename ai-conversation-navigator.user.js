@@ -4355,6 +4355,7 @@
             });
             if (overlaps) return false;
             _cgptAwaitingDomTurnover = false;
+            _cgptOutgoingMessageIds.clear();
             return true;
         }
 
@@ -4362,6 +4363,7 @@
         // unusable: after one short render window, accept the DOM rather than blocking.
         if (Date.now() - _cgptRouteChangedAt >= 650) {
             _cgptAwaitingDomTurnover = false;
+            _cgptOutgoingMessageIds.clear();
             return true;
         }
         return false;
