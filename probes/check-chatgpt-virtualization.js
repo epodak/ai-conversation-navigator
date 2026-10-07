@@ -291,6 +291,18 @@ function fail(msg, detail) {
   // quarantined; only a complete C window may become the DOM fallback.
   await page.evaluate(thirdId => {
     window.__probe.nativePushState({}, '', '/c/' + thirdId);
+
+    // Mutate one row immediately, BEFORE the 250ms URL watcher is expected to notice
+    // the route. This verifies that outgoing identity comes from the last trusted B
+    // snapshot, not from whatever mixed DOM happens to exist at detection time.
+    var els = Array.from(document.querySelectorAll('[data-chatgpt-search-unit-key$=":user"]'));
+    var el = els[0];
+    if (el) {
+      var q = (el.closest('section') || {}).dataset ? (el.closest('section').dataset.q || '1') : '1';
+      el.setAttribute('data-chatgpt-search-unit-key', 'probe:msg-third-' + q + ':user');
+      el.setAttribute('data-chatgpt-search-message-ids', JSON.stringify(['msg-third-' + q]));
+      el.textContent = 'Third conversation: Question number ' + q + ' about virtual scrolling';
+    }
   }, THIRD_CONVO_ID);
 
   await page.waitForFunction(() => {
@@ -315,17 +327,8 @@ function fail(msg, detail) {
     fail('B DOM leaked into C after C API failure', JSON.stringify(cOldDom));
   }
 
-  // Replace just ONE mounted row with C. Signature changed, but B identities remain,
-  // so zero-overlap gating must still refuse fallback.
-  await page.evaluate(() => {
-    var els = Array.from(document.querySelectorAll('[data-chatgpt-search-unit-key$=":user"]'));
-    var el = els[0];
-    if (!el) return;
-    var q = (el.closest('section') || {}).dataset ? (el.closest('section').dataset.q || '1') : '1';
-    el.setAttribute('data-chatgpt-search-unit-key', 'probe:msg-third-' + q + ':user');
-    el.setAttribute('data-chatgpt-search-message-ids', JSON.stringify(['msg-third-' + q]));
-    el.textContent = 'Third conversation: Question number ' + q + ' about virtual scrolling';
-  });
+  // One C row is already present from before route detection, while the remaining
+  // rows still belong to B. Zero-overlap gating must continue to refuse fallback.
   await page.waitForTimeout(800);
 
   const cPartial = await page.evaluate(() => ({
