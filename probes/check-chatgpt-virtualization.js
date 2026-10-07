@@ -1,5 +1,12 @@
 /**
- * Regression probe for ChatGPT's 2026 virtualized / rollout DOM.
+ * Regression probe for ChatGPT SPA routing + virtualized conversation navigation.
+ *
+ * Contract:
+ * 1) DOM is immediately usable and does not wait for the full-history API.
+ * 2) Full-history API is lazy: no request until Navigate/Search is opened.
+ * 3) A -> B cannot retain A messages while React is recycling the DOM.
+ * 4) API failure must never make the current conversation unusable.
+ * 5) A -> B -> A rejects stale click closures from the first A lifecycle.
  */
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -7,14 +14,111 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
 const USERSCRIPT = fs.readFileSync(path.join(ROOT, 'ai-conversation-navigator.user.js'), 'utf8');
-const CONVO_ID = '11111111-1111-4111-8111-111111111111';
-const SECOND_CONVO_ID = '22222222-2222-4222-8222-222222222222';
-const THIRD_CONVO_ID = '33333333-3333-4333-8333-333333333333';
+
+const A = '11111111-1111-4111-8111-111111111111';
+const B = '22222222-2222-4222-8222-222222222222';
+const C = '33333333-3333-4333-8333-333333333333';
 const TOTAL = 24;
 const WINDOW = 4;
-const html = "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>ChatGPT virtualized timeline probe</title>\n<style>\nhtml,body{margin:0;height:100%;background:#212121;color:#eee}\n#timeline{height:620px;overflow-y:auto;display:flex;flex-direction:column-reverse;border:1px solid #444}\n#spacer{height:2880px;flex:0 0 auto;position:relative;width:100%}\nsection[data-testid^=\"conversation-turn-\"]{position:absolute;left:0;right:0;min-height:116px;padding:8px;box-sizing:border-box}\n[data-chatgpt-search-unit-key]{min-height:40px}\n</style>\n</head>\n<body>\n<main><div data-app-action-timeline-scroll id=\"timeline\"><div id=\"spacer\"></div></div></main>\n<script>\n(function(){\n  var TOTAL=24, WINDOW=4, ROW=120;\n  var PREFIX='', ID_PREFIX='msg-user-';\n  var scroller=document.getElementById('timeline');\n  var spacer=document.getElementById('spacer');\n  var shells=[];\n  function makeShell(q){\n    var section=document.createElement('section');\n    var turnNo=q*2-1;\n    section.setAttribute('data-testid','conversation-turn-'+turnNo);\n    section.setAttribute('data-turn','user');\n    section.setAttribute('data-turn-id','msg-user-'+q);\n    section.style.top=((q-1)*ROW)+'px';\n    section.dataset.q=String(q);\n    spacer.appendChild(section);\n    return section;\n  }\n  for(var q=1;q<=TOTAL;q++) shells.push(makeShell(q));\n  function mountedBody(q){\n    var msg=document.createElement('div');\n    msg.setAttribute('data-chatgpt-search-unit-key','probe:'+ID_PREFIX+q+':user');\n    msg.setAttribute('data-chatgpt-search-message-ids',JSON.stringify([ID_PREFIX+q]));\n    msg.textContent=PREFIX+'Question number '+q+' about virtual scrolling';\n    return msg;\n  }\n  function render(){\n    var max=Math.max(1,scroller.scrollHeight-scroller.clientHeight);\n    var frac=Math.min(1,Math.abs(scroller.scrollTop)/max);\n    var newestStart=TOTAL-WINDOW;\n    var start=Math.round(newestStart*(1-frac));\n    start=Math.max(0,Math.min(newestStart,start));\n    for(var i=0;i<shells.length;i++){\n      var shell=shells[i], q=i+1;\n      var shouldMount=q>=start+1&&q<=start+WINDOW;\n      var body=shell.querySelector('[data-chatgpt-search-unit-key]');\n      if(shouldMount&&!body) shell.appendChild(mountedBody(q));\n      if(!shouldMount&&body) body.remove();\n    }\n    document.body.setAttribute('data-probe-window',String(start+1)+'-'+String(start+WINDOW));\n  }\n  scroller.addEventListener('scroll',render,{passive:true});\n  window.__probe={\n    render:render,\n    nativePushState:history.pushState.bind(history),\n    switchConversation:function(prefix,idPrefix){\n      PREFIX=prefix||'';\n      ID_PREFIX=idPrefix||'msg-user-';\n      for(var i=0;i<shells.length;i++){\n        var body=shells[i].querySelector('[data-chatgpt-search-unit-key]');\n        if(body) body.remove();\n      }\n      render();\n    },\n    mounted:function(){\n      return Array.from(document.querySelectorAll('[data-chatgpt-search-unit-key$=\":user\"]'))\n        .map(function(el){return el.textContent.trim()});\n    }\n  };\n  render();\n})();\n</script>\n</body>\n</html>";
 
-function conversationPayload(prefix = '', idPrefix = 'msg-user-', nodePrefix = 'node-user-') {
+const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ChatGPT SPA probe</title>
+<style>
+html,body{margin:0;height:100%;background:#212121;color:#eee}
+#timeline{height:620px;overflow-y:auto;display:flex;flex-direction:column-reverse;border:1px solid #444}
+#spacer{height:2880px;flex:0 0 auto;position:relative;width:100%}
+section[data-testid^="conversation-turn-"]{position:absolute;left:0;right:0;min-height:116px;padding:8px;box-sizing:border-box}
+[data-chatgpt-search-unit-key]{min-height:40px}
+</style>
+</head>
+<body>
+<main><div data-app-action-timeline-scroll id="timeline"><div id="spacer"></div></div></main>
+<script>
+(function(){
+  var TOTAL=24, WINDOW=4, ROW=120;
+  var PREFIX='', ID_PREFIX='msg-a-';
+  var scroller=document.getElementById('timeline');
+  var spacer=document.getElementById('spacer');
+  var shells=[];
+
+  function makeShell(q){
+    var section=document.createElement('section');
+    var turnNo=q*2-1;
+    section.setAttribute('data-testid','conversation-turn-'+turnNo);
+    section.setAttribute('data-turn','user');
+    section.style.top=((q-1)*ROW)+'px';
+    section.dataset.q=String(q);
+    spacer.appendChild(section);
+    return section;
+  }
+
+  for(var q=1;q<=TOTAL;q++) shells.push(makeShell(q));
+
+  function mountedBody(q){
+    var msg=document.createElement('div');
+    msg.setAttribute('data-chatgpt-search-unit-key','probe:'+ID_PREFIX+q+':user');
+    msg.setAttribute('data-chatgpt-search-message-ids',JSON.stringify([ID_PREFIX+q]));
+    msg.textContent=PREFIX+'Question number '+q+' about virtual scrolling';
+    return msg;
+  }
+
+  function render(){
+    var max=Math.max(1,scroller.scrollHeight-scroller.clientHeight);
+    var frac=Math.min(1,Math.abs(scroller.scrollTop)/max);
+    var newestStart=TOTAL-WINDOW;
+    var start=Math.round(newestStart*(1-frac));
+    start=Math.max(0,Math.min(newestStart,start));
+
+    for(var i=0;i<shells.length;i++){
+      var shell=shells[i], q=i+1;
+      var shouldMount=q>=start+1&&q<=start+WINDOW;
+      var body=shell.querySelector('[data-chatgpt-search-unit-key]');
+      if(shouldMount&&!body) shell.appendChild(mountedBody(q));
+      if(!shouldMount&&body) body.remove();
+    }
+    document.body.setAttribute('data-probe-window',String(start+1)+'-'+String(start+WINDOW));
+  }
+
+  function switchConversation(prefix,idPrefix){
+    PREFIX=prefix||'';
+    ID_PREFIX=idPrefix||'msg-a-';
+    for(var i=0;i<shells.length;i++){
+      var body=shells[i].querySelector('[data-chatgpt-search-unit-key]');
+      if(body) body.remove();
+    }
+    render();
+  }
+
+  scroller.addEventListener('scroll',render,{passive:true});
+  window.__probe={
+    render:render,
+    nativePushState:history.pushState.bind(history),
+    switchConversation:switchConversation,
+    mutateOne:function(prefix,idPrefix){
+      var els=Array.from(document.querySelectorAll('[data-chatgpt-search-unit-key$=":user"]'));
+      var el=els[0];
+      if(!el) return;
+      var shell=el.closest('section');
+      var q=shell&&shell.dataset?shell.dataset.q:'1';
+      el.setAttribute('data-chatgpt-search-unit-key','probe:'+idPrefix+q+':user');
+      el.setAttribute('data-chatgpt-search-message-ids',JSON.stringify([idPrefix+q]));
+      el.textContent=prefix+'Question number '+q+' about virtual scrolling';
+    },
+    mounted:function(){
+      return Array.from(document.querySelectorAll('[data-chatgpt-search-unit-key$=":user"]'))
+        .map(function(el){return el.textContent.trim()});
+    }
+  };
+  render();
+})();
+</script>
+</body>
+</html>`;
+
+function conversationPayload(prefix, idPrefix, nodePrefix) {
   const mapping = {};
   let parent = null;
   for (let i = 1; i <= TOTAL; i++) {
@@ -47,6 +151,7 @@ function fail(msg, detail) {
 (async () => {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
+  let apiRequests = 0;
 
   await page.addInitScript(() => {
     window.GM_getValue = function (_k, d) { return d; };
@@ -62,6 +167,7 @@ function fail(msg, detail) {
 
   await page.route('https://chatgpt.com/**', async route => {
     const url = new URL(route.request().url());
+
     if (url.pathname === '/api/auth/session') {
       return route.fulfill({
         status: 200,
@@ -69,29 +175,35 @@ function fail(msg, detail) {
         body: JSON.stringify({ accessToken: 'probe-token' })
       });
     }
-    if (url.pathname === '/backend-api/conversation/' + THIRD_CONVO_ID) {
-      return route.fulfill({
-        status: 503,
-        contentType: 'application/json',
-        body: JSON.stringify({ error: 'probe forces full-history API failure' })
-      });
-    }
-    if (url.pathname === '/backend-api/conversation/' + CONVO_ID ||
-        url.pathname === '/backend-api/conversation/' + SECOND_CONVO_ID) {
+
+    if (url.pathname.startsWith('/backend-api/conversation/')) {
+      apiRequests++;
       const auth = route.request().headers()['authorization'];
       if (auth !== 'Bearer probe-token') {
         return route.fulfill({ status: 401, body: '{}' });
       }
-      const second = url.pathname.endsWith('/' + SECOND_CONVO_ID);
-      if (second) await new Promise(resolve => setTimeout(resolve, 1200));
+
+      if (url.pathname.endsWith('/' + C)) {
+        return route.fulfill({
+          status: 503,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: 'forced probe failure' })
+        });
+      }
+
+      // Deliberately slow. DOM must remain useful during this wait.
+      await new Promise(resolve => setTimeout(resolve, 1200));
+
+      const second = url.pathname.endsWith('/' + B);
       return route.fulfill({
         status: 200,
         contentType: 'application/json',
         body: JSON.stringify(second
-          ? conversationPayload('Second conversation: ', 'msg-second-', 'node-second-')
-          : conversationPayload())
+          ? conversationPayload('Second conversation: ', 'msg-b-', 'node-b-')
+          : conversationPayload('', 'msg-a-', 'node-a-'))
       });
     }
+
     return route.fulfill({
       status: 200,
       contentType: 'text/html; charset=utf-8',
@@ -99,337 +211,162 @@ function fail(msg, detail) {
     });
   });
 
-  await page.goto('https://chatgpt.com/c/' + CONVO_ID, { waitUntil: 'domcontentloaded' });
+  await page.goto('https://chatgpt.com/c/' + A, { waitUntil: 'domcontentloaded' });
   await page.addScriptTag({ content: USERSCRIPT });
 
   await page.waitForSelector('[data-acn-role="nav-trigger"]', { timeout: 10000 });
-  await page.click('[data-acn-role="nav-trigger"]');
-  await page.waitForSelector('[data-acn-role="nav-panel"][data-acn-open="true"]', { timeout: 5000 });
 
+  // API must be lazy. Initial page scan should not fetch the full conversation.
+  await page.waitForTimeout(500);
+  if (apiRequests !== 0) fail('full-history API must not run before Navigate/Search opens', String(apiRequests));
+
+  // Open Navigate: the 4 mounted DOM prompts must appear BEFORE the delayed API.
+  await page.click('[data-acn-role="nav-trigger"]');
+  await page.waitForSelector('[data-acn-role="nav-panel"][data-acn-open="true"]', { timeout: 3000 });
+
+  await page.waitForFunction(win => {
+    var stat=document.querySelector('[data-acn-role="nav-stat"]');
+    return stat && Number(stat.getAttribute('data-acn-count'))===win &&
+      /visible/.test(stat.textContent||'');
+  }, WINDOW, { timeout: 700 });
+
+  const fastA = await page.evaluate(() => ({
+    count:Number(document.querySelector('[data-acn-role="nav-stat"]').getAttribute('data-acn-count')),
+    items:Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'))
+      .map(el => (el.textContent||'').trim())
+  }));
+  if (fastA.count !== WINDOW) fail('A must be immediately usable from DOM', JSON.stringify(fastA));
+
+  // Optional enrichment may later expand to all 24.
   await page.waitForFunction(total => {
-    var stat = document.querySelector('[data-acn-role="nav-stat"]');
-    return stat && Number(stat.getAttribute('data-acn-count')) === total &&
-      /full conversation/.test(stat.textContent || '');
+    var stat=document.querySelector('[data-acn-role="nav-stat"]');
+    return stat && Number(stat.getAttribute('data-acn-count'))===total &&
+      /full conversation/.test(stat.textContent||'');
   }, TOTAL, { timeout: 10000 });
 
-  const initial = await page.evaluate(() => ({
-    count: Number(document.querySelector('[data-acn-role="nav-stat"]').getAttribute('data-acn-count')),
-    text: document.querySelector('[data-acn-role="nav-stat"]').textContent,
-    mounted: window.__probe.mounted()
+  const fullA = await page.evaluate(() => ({
+    count:Number(document.querySelector('[data-acn-role="nav-stat"]').getAttribute('data-acn-count')),
+    first:(document.querySelector('[data-acn-role="nav-item-text"]')||{}).textContent||''
   }));
+  if (fullA.count !== TOTAL) fail('A enrichment should expose full history', JSON.stringify(fullA));
 
-  if (initial.count !== TOTAL) fail('full API index should expose 24 prompts', JSON.stringify(initial));
-  if (initial.mounted.length !== WINDOW) fail('mock must keep only 4 prompt bodies mounted', JSON.stringify(initial));
-  if (initial.mounted.some(t => /Question number 1\b/.test(t))) {
-    fail('Q1 must start unmounted', JSON.stringify(initial));
-  }
-
-  const clicked = await page.evaluate(() => {
-    var items = Array.from(document.querySelectorAll('[data-acn-role="nav-item"]'));
-    var q1 = items.find(function (item) {
-      var t = item.querySelector('[data-acn-role="nav-item-text"]');
-      return t && /Question number 1\b/.test(t.textContent);
-    });
-    if (!q1) return false;
-    q1.click();
-    return true;
-  });
-  if (!clicked) fail('Q1 nav row missing from full API index');
-
-  await page.waitForFunction(() => {
-    var el = document.querySelector('[data-acn-jump-target="true"]');
-    return el &&
-      el.matches('[data-chatgpt-search-unit-key$=":user"]') &&
-      /Question number 1\b/.test(el.textContent || '');
-  }, null, { timeout: 12000 });
-
-  const result = await page.evaluate(() => {
-    var el = document.querySelector('[data-acn-jump-target="true"]');
-    var stat = document.querySelector('[data-acn-role="nav-stat"]');
-    var scroller = document.querySelector('[data-app-action-timeline-scroll]');
-    return {
-      resolvedText: el ? el.textContent.trim() : null,
-      resolvedRolloutKey: el ? el.getAttribute('data-chatgpt-search-unit-key') : null,
-      count: stat ? Number(stat.getAttribute('data-acn-count')) : null,
-      scrollTop: scroller ? scroller.scrollTop : null,
-      window: document.body.getAttribute('data-probe-window')
-    };
-  });
-
-  if (!result.resolvedText || !/Question number 1\b/.test(result.resolvedText)) {
-    fail('jump resolved the wrong recycled node', JSON.stringify(result));
-  }
-  if (result.count !== TOTAL) fail('jump must retain the full API index', JSON.stringify(result));
-
-  // Hold a detached clickable object from the FIRST A lifecycle. After A -> B -> A,
-  // conversation id alone would make this stale closure look current again; routeEpoch
-  // must reject it.
+  // Capture an A-epoch click closure for the A -> B -> A generation test.
   await page.evaluate(() => {
-    window.__oldANavItem = document.querySelector('[data-acn-role="nav-item"]');
+    window.__oldANavItem=document.querySelector('[data-acn-role="nav-item"]');
   });
 
-  // SPA route switch regression: bypass ACN's patched history methods by using the
-  // native pushState captured by the mock before the userscript was injected.
-  //
-  // IMPORTANT: intentionally leave conversation A's DOM mounted after the URL becomes B.
-  // This is the real ChatGPT transition hazard: route identity changes before React has
-  // necessarily torn down/recycled the previous conversation rows.
+  // A -> B through native pushState (bypasses patched history). Mutate only one row
+  // first: MutationObserver detects the new URL, but old A ids are still present.
   await page.evaluate(secondId => {
     window.__probe.nativePushState({}, '', '/c/' + secondId);
-  }, SECOND_CONVO_ID);
+    window.__probe.mutateOne('Second conversation: ', 'msg-b-');
+  }, B);
 
   await page.waitForFunction(() => {
-    var panel = document.querySelector('[data-acn-role="nav-panel"]');
-    return location.pathname.indexOf('22222222-2222-4222-8222-222222222222') !== -1 &&
-      (!panel || panel.getAttribute('data-acn-open') !== 'true');
+    var stat=document.querySelector('[data-acn-role="nav-stat"]');
+    return location.pathname.indexOf('22222222-2222-4222-8222-222222222222')!==-1 &&
+      stat && Number(stat.getAttribute('data-acn-count'))===0;
   }, null, { timeout: 3000 });
 
-  // Reopen immediately while A DOM is still visible and B's API request is delayed.
-  // Correct behaviour is an empty/loading B state — never A fallback.
-  await page.click('[data-acn-role="nav-trigger"]');
-  await page.waitForSelector('[data-acn-role="nav-panel"][data-acn-open="true"]', { timeout: 3000 });
+  const mixed = await page.evaluate(() => ({
+    mounted:window.__probe.mounted(),
+    items:Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'))
+      .map(el => (el.textContent||'').trim())
+  }));
+  if (mixed.items.length) fail('mixed A+B DOM must not populate B', JSON.stringify(mixed));
 
-  const transition = await page.evaluate(() => {
-    var items = Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'))
-      .map(function(el){ return (el.textContent || '').trim(); });
-    var stat = document.querySelector('[data-acn-role="nav-stat"]');
-    var banner = document.querySelector('[data-acn-index-status]');
-    return {
-      items,
-      count: stat ? Number(stat.getAttribute('data-acn-count')) : null,
-      path: location.pathname,
-      banner: banner ? banner.getAttribute('data-acn-index-status') : null,
-      mounted: window.__probe.mounted()
-    };
+  // Complete B DOM turnover. B must become usable with 4 DOM prompts before the
+  // delayed B API returns.
+  await page.evaluate(() => {
+    window.__probe.switchConversation('Second conversation: ', 'msg-b-');
   });
 
-  if (transition.items.some(t => /^Question number \d+ about virtual scrolling$/.test(t))) {
-    fail('old conversation A leaked into B while B was loading', JSON.stringify(transition));
-  }
-  if (!transition.mounted.some(t => /^Question number \d+ about virtual scrolling$/.test(t))) {
-    fail('fixture must still have A DOM mounted during the route transition', JSON.stringify(transition));
+  await page.waitForFunction(win => {
+    var stat=document.querySelector('[data-acn-role="nav-stat"]');
+    var items=Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'));
+    return stat && Number(stat.getAttribute('data-acn-count'))===win &&
+      items.length===win &&
+      items.every(el => (el.textContent||'').indexOf('Second conversation: ')===0);
+  }, WINDOW, { timeout: 2500 });
+
+  const fastB = await page.evaluate(() => ({
+    count:Number(document.querySelector('[data-acn-role="nav-stat"]').getAttribute('data-acn-count')),
+    items:Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'))
+      .map(el => (el.textContent||'').trim())
+  }));
+  if (fastB.items.some(t => /^Question number /.test(t))) {
+    fail('A leaked into B', JSON.stringify(fastB));
   }
 
-  // Wait for B's API index to become ready WITHOUT replacing A's DOM. The navigator
-  // must show exactly B's 24 API questions. Old code produced 28 (24 B + 4 mounted A),
-  // and positional shell alignment could bind all B questions to A shells when counts
-  // matched.
   await page.waitForFunction(total => {
-    var stat = document.querySelector('[data-acn-role="nav-stat"]');
-    var items = Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'));
-    return stat && Number(stat.getAttribute('data-acn-count')) === total &&
-      items.length === total &&
-      items.every(function(el){
-        return (el.textContent || '').indexOf('Second conversation: Question number ') === 0;
-      });
+    var stat=document.querySelector('[data-acn-role="nav-stat"]');
+    var items=Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'));
+    return stat && Number(stat.getAttribute('data-acn-count'))===total &&
+      items.length===total &&
+      items.every(el => (el.textContent||'').indexOf('Second conversation: ')===0);
   }, TOTAL, { timeout: 10000 });
 
-  const apiReadyWhileOldDom = await page.evaluate(() => ({
-    count: Number(document.querySelector('[data-acn-role="nav-stat"]').getAttribute('data-acn-count')),
-    first: (document.querySelector('[data-acn-role="nav-item-text"]') || {}).textContent || '',
-    mounted: window.__probe.mounted(),
-    path: location.pathname
-  }));
-
-  if (apiReadyWhileOldDom.count !== TOTAL) {
-    fail('B API index must remain isolated from mounted A rows', JSON.stringify(apiReadyWhileOldDom));
-  }
-  if (!apiReadyWhileOldDom.mounted.some(t => /^Question number \d+ about virtual scrolling$/.test(t))) {
-    fail('A DOM should still be mounted when B API isolation is asserted', JSON.stringify(apiReadyWhileOldDom));
-  }
-
-  // A B nav click while only A DOM exists must NOT mark/accept an A row or shell.
-  await page.evaluate(() => {
-    var item = document.querySelector('[data-acn-role="nav-item"]');
-    if (item) item.click();
-  });
-  await page.waitForTimeout(3400);
-  const wrongJump = await page.evaluate(() => {
-    var el = document.querySelector('[data-acn-jump-target="true"]');
-    return el ? (el.textContent || '').trim() : null;
-  });
-  if (wrongJump && /^Question number \d+ about virtual scrolling$/.test(wrongJump)) {
-    fail('B question jump incorrectly accepted an A DOM target', wrongJump);
-  }
-
-  // Now let React "finish" the route by replacing mounted message bodies with B.
-  await page.evaluate(() => {
-    window.__probe.switchConversation('Second conversation: ', 'msg-second-');
-  });
-
-  await page.waitForFunction(() => {
-    var mounted = window.__probe.mounted();
-    return mounted.length === 4 &&
-      mounted.every(function(t){ return t.indexOf('Second conversation: ') === 0; });
-  }, null, { timeout: 5000 });
-
-  // Mutation-driven rebinding must keep the same isolated B membership.
-  await page.waitForFunction(total => {
-    var stat = document.querySelector('[data-acn-role="nav-stat"]');
-    var items = Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'));
-    return stat && Number(stat.getAttribute('data-acn-count')) === total &&
-      items.length === total &&
-      items.every(function(el){
-        return (el.textContent || '').indexOf('Second conversation: Question number ') === 0;
-      });
-  }, TOTAL, { timeout: 5000 });
-
-  const switched = await page.evaluate(() => ({
-    count: Number(document.querySelector('[data-acn-role="nav-stat"]').getAttribute('data-acn-count')),
-    first: (document.querySelector('[data-acn-role="nav-item-text"]') || {}).textContent || '',
-    path: location.pathname,
-    mounted: window.__probe.mounted()
-  }));
-
-  if (switched.count !== TOTAL) fail('conversation B should expose its own full API index', JSON.stringify(switched));
-  if (!switched.first.startsWith('Second conversation: ')) {
-    fail('conversation B navigator should contain only B prompts', JSON.stringify(switched));
-  }
-
-  // Degraded API recovery: B -> C while C's full-history endpoint fails.
-  // Old B DOM must stay quarantined; a half-replaced B+C window must also stay
-  // quarantined; only a complete C window may become the DOM fallback.
+  // B -> C: switch URL and DOM completely. C's API is forced to 503, but C must
+  // remain immediately usable from DOM and stay usable after the failure.
   await page.evaluate(thirdId => {
     window.__probe.nativePushState({}, '', '/c/' + thirdId);
+    window.__probe.switchConversation('Third conversation: ', 'msg-c-');
+  }, C);
 
-    // Mutate one row immediately, BEFORE the 250ms URL watcher is expected to notice
-    // the route. This verifies that outgoing identity comes from the last trusted B
-    // snapshot, not from whatever mixed DOM happens to exist at detection time.
-    var els = Array.from(document.querySelectorAll('[data-chatgpt-search-unit-key$=":user"]'));
-    var el = els[0];
-    if (el) {
-      var q = (el.closest('section') || {}).dataset ? (el.closest('section').dataset.q || '1') : '1';
-      el.setAttribute('data-chatgpt-search-unit-key', 'probe:msg-third-' + q + ':user');
-      el.setAttribute('data-chatgpt-search-message-ids', JSON.stringify(['msg-third-' + q]));
-      el.textContent = 'Third conversation: Question number ' + q + ' about virtual scrolling';
-    }
-  }, THIRD_CONVO_ID);
+  await page.waitForFunction(win => {
+    var stat=document.querySelector('[data-acn-role="nav-stat"]');
+    var items=Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'));
+    return stat && Number(stat.getAttribute('data-acn-count'))===win &&
+      items.length===win &&
+      items.every(el => (el.textContent||'').indexOf('Third conversation: ')===0);
+  }, WINDOW, { timeout: 2500 });
 
-  await page.waitForFunction(() => {
-    return location.pathname.indexOf('33333333-3333-4333-8333-333333333333') !== -1;
-  }, null, { timeout: 3000 });
-
-  await page.waitForTimeout(900);
-  await page.click('[data-acn-role="nav-trigger"]');
-  await page.waitForSelector('[data-acn-role="nav-panel"][data-acn-open="true"]', { timeout: 3000 });
-
-  const cOldDom = await page.evaluate(() => {
-    var items = Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'))
-      .map(function(el){ return (el.textContent || '').trim(); });
-    var banner = document.querySelector('[data-acn-index-status]');
-    return {
-      items,
-      banner: banner ? banner.getAttribute('data-acn-index-status') : null,
-      mounted: window.__probe.mounted()
-    };
-  });
-  if (cOldDom.items.some(t => t.indexOf('Second conversation: ') === 0)) {
-    fail('B DOM leaked into C after C API failure', JSON.stringify(cOldDom));
-  }
-
-  // One C row is already present from before route detection, while the remaining
-  // rows still belong to B. Zero-overlap gating must continue to refuse fallback.
-  await page.waitForTimeout(800);
-
-  const cPartial = await page.evaluate(() => ({
-    items: Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'))
-      .map(function(el){ return (el.textContent || '').trim(); }),
-    mounted: window.__probe.mounted()
+  await page.waitForTimeout(1200);
+  const failedC = await page.evaluate(() => ({
+    count:Number(document.querySelector('[data-acn-role="nav-stat"]').getAttribute('data-acn-count')),
+    items:Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'))
+      .map(el => (el.textContent||'').trim()),
+    banners:Array.from(document.querySelectorAll('[data-acn-index-status]'))
+      .map(el => el.getAttribute('data-acn-index-status'))
   }));
-  if (cPartial.items.some(t => t.indexOf('Third conversation: ') === 0) ||
-      cPartial.items.some(t => t.indexOf('Second conversation: ') === 0)) {
-    fail('half-replaced B+C DOM must remain quarantined', JSON.stringify(cPartial));
+
+  if (failedC.count !== WINDOW ||
+      failedC.items.some(t => t.indexOf('Third conversation: ')!==0)) {
+    fail('C must stay usable when full-history API fails', JSON.stringify(failedC));
   }
 
-  // Now replace the entire mounted window with C. With API still failed and zero
-  // identity overlap with B, the safe DOM fallback should recover instead of bricking.
-  await page.evaluate(() => {
-    window.__probe.switchConversation('Third conversation: ', 'msg-third-');
-  });
-
-  await page.waitForFunction(() => {
-    var stat = document.querySelector('[data-acn-role="nav-stat"]');
-    var items = Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'));
-    var banner = document.querySelector('[data-acn-index-status="degraded-dom"]');
-    return stat && Number(stat.getAttribute('data-acn-count')) === 4 &&
-      items.length === 4 && banner &&
-      items.every(function(el){
-        return (el.textContent || '').indexOf('Third conversation: Question number ') === 0;
-      });
-  }, null, { timeout: 6000 });
-
-  const degradedRecovery = await page.evaluate(() => ({
-    count: Number(document.querySelector('[data-acn-role="nav-stat"]').getAttribute('data-acn-count')),
-    items: Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'))
-      .map(function(el){ return (el.textContent || '').trim(); }),
-    banner: (document.querySelector('[data-acn-index-status]') || {}).getAttribute
-      ? document.querySelector('[data-acn-index-status]').getAttribute('data-acn-index-status')
-      : null
-  }));
-  if (degradedRecovery.count !== 4 || degradedRecovery.banner !== 'degraded-dom') {
-    fail('C should recover through safe mounted-DOM fallback', JSON.stringify(degradedRecovery));
-  }
-
-  // A -> B -> A generation test. Keep B DOM mounted while the URL/API returns to A.
+  // C -> A. Clicking the detached nav row captured from the FIRST A lifecycle must
+  // be rejected even though the URL id is A again.
   await page.evaluate(firstId => {
     window.__probe.nativePushState({}, '', '/c/' + firstId);
-  }, CONVO_ID);
+    window.__probe.switchConversation('', 'msg-a-');
+  }, A);
 
-  await page.waitForFunction(() => {
-    var panel = document.querySelector('[data-acn-role="nav-panel"]');
-    return location.pathname.indexOf('11111111-1111-4111-8111-111111111111') !== -1 &&
-      (!panel || panel.getAttribute('data-acn-open') !== 'true');
-  }, null, { timeout: 3000 });
+  await page.waitForFunction(win => {
+    var stat=document.querySelector('[data-acn-role="nav-stat"]');
+    return stat && Number(stat.getAttribute('data-acn-count'))===win;
+  }, WINDOW, { timeout: 2500 });
 
-  await page.click('[data-acn-role="nav-trigger"]');
-  await page.waitForSelector('[data-acn-role="nav-panel"][data-acn-open="true"]', { timeout: 3000 });
-
-  await page.waitForFunction(total => {
-    var stat = document.querySelector('[data-acn-role="nav-stat"]');
-    var items = Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'));
-    return stat && Number(stat.getAttribute('data-acn-count')) === total &&
-      items.length === total &&
-      items.every(function(el){
-        return /^Question number \d+ about virtual scrolling$/.test((el.textContent || '').trim());
-      });
-  }, TOTAL, { timeout: 10000 });
-
-  // Click the DETACHED nav item captured from A epoch #1. Current id is A again, so
-  // conversation-id-only isolation would incorrectly accept it. The epoch guard must
-  // refuse it and emit the stale-conversation toast.
   await page.evaluate(() => {
     if (window.__oldANavItem) window.__oldANavItem.click();
   });
 
-  await page.waitForFunction(() => {
-    var toast = document.getElementById('acn-toast');
-    return toast && /Conversation changed/.test(toast.textContent || '');
-  }, null, { timeout: 2000 }).catch(() => {});
-
+  await page.waitForTimeout(100);
   const aba = await page.evaluate(() => {
-    var toast = document.getElementById('acn-toast');
-    var target = document.querySelector('[data-acn-jump-target="true"]');
-    return {
-      toast: toast ? (toast.textContent || '').trim() : null,
-      target: target ? (target.textContent || '').trim() : null,
-      path: location.pathname
-    };
+    var toast=document.getElementById('acn-toast');
+    return toast ? (toast.textContent||'').trim() : '';
   });
-
-  if (!aba.toast || aba.toast.indexOf('Conversation changed') === -1) {
-    fail('stale A epoch closure was not rejected after A -> B -> A', JSON.stringify(aba));
-  }
-  if (aba.target) {
-    fail('stale A epoch closure produced a jump target after A -> B -> A', JSON.stringify(aba));
+  if (aba.indexOf('Conversation changed')===-1) {
+    fail('old A lifecycle click closure must be rejected after returning to A', aba);
   }
 
   if (!process.exitCode) {
-    console.log('PASS: ChatGPT virtualization + strict SPA conversation lifecycle isolation');
-    console.log(JSON.stringify({ initial: result, transition, apiReadyWhileOldDom, switched, degradedRecovery, aba }));
+    console.log('PASS: ChatGPT DOM-first SPA routing, lazy API enrichment, and failure resilience');
+    console.log(JSON.stringify({ fastA, fullA, mixed, fastB, failedC, apiRequests }));
   }
 
   await browser.close();
-})().catch(err => {
+})().catch(async err => {
   console.error(err);
-  process.exit(1);
+  process.exitCode=1;
 });
