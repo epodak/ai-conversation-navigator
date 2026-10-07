@@ -4336,6 +4336,17 @@
         // disappear, then let the next DOM mutation populate the new conversation.
         if (typeof orbOnScanComplete === 'function') orbOnScanComplete();
 
+        // One fallback retry only (not polling) for rollouts that temporarily expose
+        // no stable message ids and happen not to mutate again after the route change.
+        if (_cgptAwaitingDomTurnover) {
+            var routeEpoch = _cgptRouteEpoch;
+            setTimeout(function () {
+                if (_cgptRouteEpoch === routeEpoch && _cgptAwaitingDomTurnover) {
+                    scanConversation(false);
+                }
+            }, 700);
+        }
+
         console.log('[ACN ChatGPT] route:', prevKey, '->', nextKey,
                     '(epoch ' + _cgptRouteEpoch + ')');
         return true;
