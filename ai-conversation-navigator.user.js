@@ -3702,6 +3702,9 @@
     var _cgptIndexStatus = 'idle'; // idle | loading | ready | degraded
     var _cgptIndexConversationId = null;
     var _cgptIndexQuestions = [];
+    // Stable message-id keys for the entire active API path (user + assistant).
+    // Used to prove that mounted DOM belongs wholly to the current conversation.
+    var _cgptIndexMessageKeys = new Set();
     var _cgptIndexInFlight = false;
     var _cgptIndexRequestSeq = 0;
     var _cgptIndexFailedAt = 0;
@@ -4342,6 +4345,7 @@
         _cgptIndexConversationId = null;
         _cgptIndexRouteEpoch = -1;
         _cgptIndexQuestions = [];
+        _cgptIndexMessageKeys = new Set();
         _cgptIndexInFlight = false;
         _cgptIndexFailedAt = 0;
         if (_cgptRefreshTimer) {
@@ -4400,6 +4404,48 @@
             out.push({ id: msg.id || null, text: text });
         }
         return out;
+    }
+
+    function _cgptActiveMessageKeySet(data) {
+        var out = new Set();
+        var mapping = data && data.mapping;
+        if (!mapping) return out;
+
+        var node = data.current_node ? mapping[data.current_node] : null;
+        for (var hops = 0; node && hops < 10000; hops++) {
+            var msg = node.message;
+            if (msg && msg.id && msg.author &&
+                (msg.author.role === 'user' || msg.author.role === 'assistant') &&
+                !(msg.metadata && msg.metadata.is_visually_hidden_from_conversation)) {
+                out.add('chatgpt|message:' + msg.id);
+            }
+            node = node.parent ? mapping[node.parent] : null;
+        }
+        return out;
+    }
+
+    function _cgptMountedDomProof() {
+        var proof = { verified: false, matched: 0, unknown: 0, stable: 0 };
+        if (_cgptIndexStatus !== 'ready' ||
+            _cgptIndexConversationId !== _cgptConversationId() ||
+            _cgptIndexRouteEpoch !== _cgptRouteEpoch) {
+            return proof;
+        }
+
+        var mounted = Array.from(getUserMessages()).concat(Array.from(getAIMessages()));
+        for (var i = 0; i < mounted.length; i++) {
+            var raw = platform.getMessageKey ? platform.getMessageKey(mounted[i]) : null;
+            // Only a real message id is identity proof. Unit keys / turn ordinals /
+            // text fallbacks are useful locators but not cross-conversation identity.
+            if (!raw || raw.indexOf('message:') !== 0) continue;
+            proof.stable++;
+            var key = 'chatgpt|' + raw;
+            if (_cgptIndexMessageKeys.has(key)) proof.matched++;
+            else proof.unknown++;
+        }
+
+        proof.verified = proof.matched > 0 && proof.unknown === 0;
+        return proof;
     }
 
     function _cgptBuildQuestions(data, ownerId, ownerEpoch) {
@@ -4512,7 +4558,6 @@
         // If B's DOM is already identity-verified and an unknown row is beyond the
         // snapshot's max turn index, schedule a refresh and wait for the API to own it.
         if (verifiedCurrentDom) {
-            _cgptDomVerifiedEpoch = currentEpoch;
             for (var k = 0; k < mounted.length; k++) {
                 var t2 = _readMessageText(mounted[k]);
                 if (!t2) continue;
@@ -4600,9 +4645,11 @@
                     requestEpoch !== _cgptRouteEpoch) return;
                 var questions = _cgptBuildQuestions(data, id, requestEpoch);
                 if (!questions.length) throw new Error('conversation had no visible user prompts');
+                var messageKeys = _cgptActiveMessageKeySet(data);
                 _cgptIndexConversationId = id;
                 _cgptIndexRouteEpoch = requestEpoch;
                 _cgptIndexQuestions = questions;
+                _cgptIndexMessageKeys = messageKeys;
                 _cgptIndexStatus = 'ready';
                 _cgptIndexFailedAt = 0;
                 _cgptRouteTransition = false;
@@ -4614,6 +4661,7 @@
                 _cgptIndexConversationId = id;
                 _cgptIndexRouteEpoch = requestEpoch;
                 _cgptIndexQuestions = [];
+                _cgptIndexMessageKeys = new Set();
                 _cgptIndexStatus = 'degraded';
                 _cgptIndexFailedAt = Date.now();
                 console.warn('[ACN ChatGPT] full-history index unavailable; DOM is quarantined to prevent cross-conversation mixing:', err);
@@ -4699,15 +4747,26 @@
                     _cgptIndexRouteEpoch === _cgptRouteEpoch &&
                     _cgptIndexQuestions.length) {
                     _questions = _cgptBindMountedAndMerge(_cgptIndexQuestions);
-                    // Do not source assistant state from mounted DOM here. During a route
-                    // transition that DOM can still be A even though the URL/index are B.
-                    _aiResponses = [];
-                    // Bookmark injection is DOM-derived. Only touch the page after at
-                    // least one mounted B message id has matched the B API snapshot.
-                    if (_cgptDomVerifiedEpoch === _cgptRouteEpoch &&
-                        typeof injectBookmarkIcons === 'function') {
-                        injectBookmarkIcons();
+
+                    // Full mounted-window proof, across BOTH user and assistant ids.
+                    // A single unknown stable id means React is still showing another
+                    // conversation or a newer message not yet represented by the API.
+                    var domProof = _cgptMountedDomProof();
+                    if (domProof.verified) {
+                        _cgptDomVerifiedEpoch = _cgptRouteEpoch;
+                        _aiResponses = Array.from(getAIMessages());
+                        if (typeof injectBookmarkIcons === 'function') injectBookmarkIcons();
+                    } else {
+                        _cgptDomVerifiedEpoch = -1;
+                        _aiResponses = [];
+                        // If some current ids match and some are unknown, this can be
+                        // either a partially-recycled route transition or a newly sent /
+                        // streaming message. Refresh the API, but never merge the DOM.
+                        if (domProof.matched > 0 && domProof.unknown > 0) {
+                            _cgptScheduleRefresh();
+                        }
                     }
+
                     if (typeof orbOnScanComplete === 'function') orbOnScanComplete();
                     return;
                 }
