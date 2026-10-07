@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI Conversation Navigator
 // @namespace    http://tampermonkey.net/
-// @version      12.15
+// @version      12.16
 // @description  Orbital navigation interface for AI chat platforms — Claude, ChatGPT, Grok, Gemini, Bolt, Lovable, Replit, V0, Base44, Emergent, Perplexity, and Firebase Studio
 // @updateURL    https://raw.githubusercontent.com/epodak/ai-conversation-navigator/main/ai-conversation-navigator.meta.js
 // @downloadURL  https://raw.githubusercontent.com/epodak/ai-conversation-navigator/main/ai-conversation-navigator.user.js
