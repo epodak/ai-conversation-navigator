@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI Conversation Navigator
 // @namespace    http://tampermonkey.net/
-// @version      12.13
+// @version      12.14
 // @description  Orbital navigation interface for AI chat platforms — Claude, ChatGPT, Grok, Gemini, Bolt, Lovable, Replit, V0, Base44, Emergent, Perplexity, and Firebase Studio
 // @updateURL    https://raw.githubusercontent.com/epodak/ai-conversation-navigator/main/ai-conversation-navigator.meta.js
 // @downloadURL  https://raw.githubusercontent.com/epodak/ai-conversation-navigator/main/ai-conversation-navigator.user.js
@@ -42,7 +42,7 @@
     // ============================================================
     // VERSION
     // ============================================================
-    var ACN_VERSION = '12.13';
+    var ACN_VERSION = '12.14';
 
     // ============================================================
     // i18n — internationalization string table
@@ -3702,6 +3702,9 @@
     var _cgptIndexStatus = 'idle'; // idle | loading | ready | degraded
     var _cgptIndexConversationId = null;
     var _cgptIndexQuestions = [];
+    // Stable message-id keys for the entire active API path (user + assistant).
+    // Used to prove that mounted DOM belongs wholly to the current conversation.
+    var _cgptIndexMessageKeys = new Set();
     var _cgptIndexInFlight = false;
     var _cgptIndexRequestSeq = 0;
     var _cgptIndexFailedAt = 0;
@@ -3710,6 +3713,18 @@
     // switch conversations without a document reload. The URL conversation id
     // is the authoritative boundary for all conversation-scoped runtime state.
     var _cgptObservedRouteKey = null;
+    // Monotonic lifecycle generation. Conversation id alone is insufficient for
+    // A -> B -> A because stale closures from the first A would otherwise look current.
+    var _cgptRouteEpoch = 0;
+    // Epoch that produced the currently cached ChatGPT API index.
+    var _cgptIndexRouteEpoch = -1;
+    // True after a route boundary until the NEW conversation has produced a validated
+    // API index. While true, DOM fallback is forbidden because ChatGPT may still be
+    // displaying the previous conversation's recycled rows.
+    var _cgptRouteTransition = false;
+    // Set only after at least one mounted message id is proven to belong to the
+    // current API snapshot. DOM-derived features are quarantined until then.
+    var _cgptDomVerifiedEpoch = -1;
     var _cgptAccessToken = null;
     var _cgptAccessTokenAt = 0;
     var _navListFingerprint    = ''; // used to skip DOM rebuild when questions are unchanged
@@ -4250,51 +4265,87 @@
         return id ? ('conversation:' + id) : ('path:' + location.pathname);
     }
 
-    function _cgptSyncRouteIdentity() {
-        if (!platform || platform.id !== 'chatgpt') return false;
+    function _cgptQuestionBelongsToCurrent(q) {
+        if (!q || platform.id !== 'chatgpt') return false;
+        return q.conversationId === _cgptConversationId() &&
+               q.routeEpoch === _cgptRouteEpoch;
+    }
 
-        var nextKey = _cgptRouteKey();
-        if (_cgptObservedRouteKey === null) {
-            _cgptObservedRouteKey = nextKey;
-            return false;
-        }
-        if (nextKey === _cgptObservedRouteKey) return false;
-
-        _cgptObservedRouteKey = nextKey;
-
-        // Hard conversation boundary. Invalidate the API snapshot AND the generic
-        // virtual-scroll harvest before either can render on the new URL.
-        // _cgptResetIndex bumps the request generation, so a late response from the
-        // conversation we just left is ignored even if it completes afterwards.
+    function _cgptClearConversationScopedState() {
         _cgptResetIndex();
         _vsAccumulatedKeys.clear();
         _questions = [];
         _aiResponses = [];
 
-        // These fingerprints skip DOM rebuilds when data appears unchanged. They are
-        // conversation-scoped identities, so carrying them across routes can preserve
-        // stale panel contents even after the underlying arrays were cleared.
+        // These caches/fingerprints all close over conversation content or objects.
         _navListFingerprint = '';
         _searchListFingerprint = '';
         _bmListFingerprint = '';
         _sumIndexStamp = null;
         _sumComputeCache = null;
 
-        resetTurnCounter();
+        // Any jump started by the previous conversation must become inert immediately.
+        // Incrementing the token cancels its settle loop; clearing busy state prevents
+        // the superseded loop from leaving the new conversation's panel disabled.
+        if (typeof _chatgptJumpToken === 'number') _chatgptJumpToken++;
+        try { orbSetJumpBusy(false); } catch (e) {}
 
-        // Existing history hooks close the panel on push/pop. Do the same for route
-        // changes detected outside those hooks so no stale A panel remains visible
-        // while B's API index is loading.
+        _cgptDomVerifiedEpoch = -1;
+
+        // Remove conversation-scoped UI state attached to DOM nodes that React may
+        // keep alive/recycle across the route boundary.
+        try {
+            document.querySelectorAll('[data-acn-jump-target="true"]').forEach(function (el) {
+                el.removeAttribute('data-acn-jump-target');
+            });
+            document.querySelectorAll('[data-acn-bookmark]').forEach(function (el) {
+                if (el.parentNode) el.parentNode.removeChild(el);
+            });
+            document.querySelectorAll('[data-acn-bookmarked]').forEach(function (el) {
+                el.removeAttribute('data-acn-bookmarked');
+            });
+            ['acn-nav-list', 'acn-search-list'].forEach(function (id) {
+                var list = document.getElementById(id);
+                if (list) while (list.firstChild) list.removeChild(list.firstChild);
+            });
+        } catch (e) {}
+
+        resetTurnCounter();
+    }
+
+    function _cgptSyncRouteIdentity() {
+        if (!platform || platform.id !== 'chatgpt') return false;
+
+        var nextKey = _cgptRouteKey();
+        if (_cgptObservedRouteKey === null) {
+            _cgptObservedRouteKey = nextKey;
+            _cgptRouteEpoch++;
+            return false;
+        }
+        if (nextKey === _cgptObservedRouteKey) return false;
+
+        var prevKey = _cgptObservedRouteKey;
+        _cgptObservedRouteKey = nextKey;
+        _cgptRouteEpoch++;
+        _cgptRouteTransition = !!_cgptConversationId();
+
+        _cgptClearConversationScopedState();
+
+        // Close visible panels before a stale DOM row can repaint them. Reopening while
+        // the new API index is loading shows an explicit loading state, never old data.
         if (typeof orbClosePanel === 'function') orbClosePanel();
 
-        console.log('[ACN ChatGPT] conversation route changed; cleared conversation-scoped state:', nextKey);
+        console.log('[ACN ChatGPT] lifecycle leave/enter:', prevKey, '->', nextKey,
+                    '(epoch ' + _cgptRouteEpoch + ')');
         return true;
     }
 
     function _cgptResetIndex() {
         _cgptIndexStatus = 'idle';
         _cgptIndexConversationId = null;
+        _cgptIndexRouteEpoch = -1;
         _cgptIndexQuestions = [];
+        _cgptIndexMessageKeys = new Set();
         _cgptIndexInFlight = false;
         _cgptIndexFailedAt = 0;
         if (_cgptRefreshTimer) {
@@ -4355,100 +4406,174 @@
         return out;
     }
 
-    function _cgptBuildQuestions(data) {
+    function _cgptActiveMessageKeySet(data) {
+        var out = new Set();
+        var mapping = data && data.mapping;
+        if (!mapping) return out;
+
+        var node = data.current_node ? mapping[data.current_node] : null;
+        for (var hops = 0; node && hops < 10000; hops++) {
+            var msg = node.message;
+            if (msg && msg.id && msg.author &&
+                (msg.author.role === 'user' || msg.author.role === 'assistant') &&
+                !(msg.metadata && msg.metadata.is_visually_hidden_from_conversation)) {
+                out.add('chatgpt|message:' + msg.id);
+            }
+            node = node.parent ? mapping[node.parent] : null;
+        }
+        return out;
+    }
+
+    function _cgptMountedDomProof() {
+        var proof = { verified: false, matched: 0, unknown: 0, stable: 0 };
+        if (_cgptIndexStatus !== 'ready' ||
+            _cgptIndexConversationId !== _cgptConversationId() ||
+            _cgptIndexRouteEpoch !== _cgptRouteEpoch) {
+            return proof;
+        }
+
+        var mounted = Array.from(getUserMessages()).concat(Array.from(getAIMessages()));
+        for (var i = 0; i < mounted.length; i++) {
+            var raw = platform.getMessageKey ? platform.getMessageKey(mounted[i]) : null;
+            // Only a real message id is identity proof. Unit keys / turn ordinals /
+            // text fallbacks are useful locators but not cross-conversation identity.
+            if (!raw || raw.indexOf('message:') !== 0) continue;
+            proof.stable++;
+            var key = 'chatgpt|' + raw;
+            if (_cgptIndexMessageKeys.has(key)) proof.matched++;
+            else proof.unknown++;
+        }
+
+        proof.verified = proof.matched > 0 && proof.unknown === 0;
+        return proof;
+    }
+
+    function _cgptBuildQuestions(data, ownerId, ownerEpoch) {
         var apiUsers = _cgptLinearUserMessages(data);
-        var shells = _cgptUserShells();
-        var aligned = shells.length > 0 && shells.length === apiUsers.length;
+
+        // Identity-first mounted lookup. Never align API entries to DOM shells merely
+        // because the COUNTS happen to match: during A -> B, A's old shells can remain
+        // mounted while B's API response arrives, and equal counts falsely bind every
+        // B question to an A shell.
+        var mountedByKey = {};
+        var mounted = Array.from(getUserMessages());
+        for (var m = 0; m < mounted.length; m++) {
+            var mt = _readMessageText(mounted[m]);
+            if (!mt) continue;
+            var mk = _vsMessageKey(mounted[m], mt);
+            if (mk) mountedByKey[mk] = mounted[m];
+        }
+
         var out = [];
         for (var i = 0; i < apiUsers.length; i++) {
-            var shell = aligned ? shells[i] : null;
-            var idx = _cgptTurnIndexFromShell(shell, i * 2 + 1);
             var key = apiUsers[i].id ? 'chatgpt|message:' + apiUsers[i].id : null;
+            var mountedMsg = key ? mountedByKey[key] : null;
+            var shell = mountedMsg && mountedMsg.closest
+                ? mountedMsg.closest('[data-testid^="conversation-turn-"], [data-turn-key]')
+                : null;
+            var idx = mountedMsg
+                ? _vsMessageIndex(mountedMsg, i * 2 + 1)
+                : (i * 2 + 1);
+
             out.push({
-                element: null,
-                shell: shell,
+                element: mountedMsg || null,
+                shell: shell || null,
+                shellVerifiedKey: shell ? key : null,
                 text: apiUsers[i].text,
                 summary: generateSummary(apiUsers[i].text),
                 vsIndex: idx,
                 messageKey: key,
                 messageId: apiUsers[i].id,
                 userOrdinal: i,
-                apiBacked: true
+                apiBacked: true,
+                conversationId: ownerId,
+                routeEpoch: ownerEpoch
             });
         }
         return out;
     }
 
     function _cgptBindMountedAndMerge(indexed) {
-        var questions = indexed.map(function (q) {
+        var currentId = _cgptConversationId();
+        var currentEpoch = _cgptRouteEpoch;
+
+        var questions = indexed.filter(function (q) {
+            return q && q.conversationId === currentId && q.routeEpoch === currentEpoch;
+        }).map(function (q) {
             return {
-                element: q.element || null,
-                shell: q.shell || null,
+                element: null,
+                shell: null,
+                shellVerifiedKey: null,
                 text: q.text,
                 summary: q.summary,
                 vsIndex: q.vsIndex,
                 messageKey: q.messageKey,
                 messageId: q.messageId,
                 userOrdinal: q.userOrdinal,
-                apiBacked: true
+                apiBacked: true,
+                conversationId: q.conversationId,
+                routeEpoch: q.routeEpoch
             };
         });
+
         var byKey = {};
+        var maxApiVsIndex = -1;
         for (var i = 0; i < questions.length; i++) {
             if (questions[i].messageKey) byKey[questions[i].messageKey] = questions[i];
+            if (typeof questions[i].vsIndex === 'number' && isFinite(questions[i].vsIndex)) {
+                maxApiVsIndex = Math.max(maxApiVsIndex, questions[i].vsIndex);
+            }
         }
 
         var mounted = Array.from(getUserMessages());
+        var verifiedCurrentDom = false;
+        var unknownAfterSnapshot = false;
+
+        // Pass 1: bind only exact message-id matches. This is the proof that the DOM
+        // row belongs to THIS API snapshot. Text, ordinal and shell count are not proof.
         for (var j = 0; j < mounted.length; j++) {
             var text = _readMessageText(mounted[j]);
             if (!text) continue;
             var key = _vsMessageKey(mounted[j], text);
-            var idx = _vsMessageIndex(mounted[j], questions.length * 2 + 1);
             var q = byKey[key];
-            if (q) {
-                q.element = mounted[j];
-                if (_normalizeFull(q.text) !== _normalizeFull(text)) {
-                    q.text = text;
-                    q.summary = generateSummary(text);
-                }
-                if (!q.shell && mounted[j].closest) {
-                    q.shell = mounted[j].closest('[data-testid^="conversation-turn-"], [data-turn-key]');
-                }
-                if (typeof idx === 'number' && isFinite(idx)) q.vsIndex = idx;
-                continue;
+            if (!q) continue;
+
+            verifiedCurrentDom = true;
+            q.element = mounted[j];
+            if (_normalizeFull(q.text) !== _normalizeFull(text)) {
+                q.text = text;
+                q.summary = generateSummary(text);
             }
-
-            var liveQ = {
-                element: mounted[j],
-                shell: mounted[j].closest
-                    ? mounted[j].closest('[data-testid^="conversation-turn-"], [data-turn-key]')
-                    : null,
-                text: text,
-                summary: generateSummary(text),
-                vsIndex: idx,
-                messageKey: key,
-                messageId: null,
-                userOrdinal: questions.length,
-                apiBacked: false
-            };
-            questions.push(liveQ);
-            byKey[key] = liveQ;
-
-            // Keep a just-sent prompt after it scrolls out of the mounted window,
-            // even if the conversation endpoint has not caught up yet.
-            indexed.push({
-                element: mounted[j],
-                shell: liveQ.shell,
-                text: liveQ.text,
-                summary: liveQ.summary,
-                vsIndex: liveQ.vsIndex,
-                messageKey: liveQ.messageKey,
-                messageId: null,
-                userOrdinal: liveQ.userOrdinal,
-                apiBacked: false
-            });
-            _cgptScheduleRefresh();
+            if (mounted[j].closest) {
+                q.shell = mounted[j].closest('[data-testid^="conversation-turn-"], [data-turn-key]');
+                q.shellVerifiedKey = q.shell ? q.messageKey : null;
+            }
+            var idx = _vsMessageIndex(mounted[j], q.vsIndex);
+            if (typeof idx === 'number' && isFinite(idx)) q.vsIndex = idx;
         }
+
+        // Pass 2: detect a truly newer prompt without ever merging it into the current
+        // snapshot. Unknown DOM rows used to be appended here; during route transition
+        // that re-imported A rows into B. The API is the sole source of membership.
+        // If B's DOM is already identity-verified and an unknown row is beyond the
+        // snapshot's max turn index, schedule a refresh and wait for the API to own it.
+        if (verifiedCurrentDom) {
+            for (var k = 0; k < mounted.length; k++) {
+                var t2 = _readMessageText(mounted[k]);
+                if (!t2) continue;
+                var k2 = _vsMessageKey(mounted[k], t2);
+                if (byKey[k2]) continue;
+                var idx2 = _vsMessageIndex(mounted[k], null);
+                if (k2 && k2.indexOf('chatgpt|') === 0 &&
+                    typeof idx2 === 'number' && isFinite(idx2) &&
+                    idx2 > maxApiVsIndex) {
+                    unknownAfterSnapshot = true;
+                    break;
+                }
+            }
+        }
+
+        if (unknownAfterSnapshot) _cgptScheduleRefresh();
 
         questions.sort(function (a, b) {
             return (typeof a.vsIndex === 'number' ? a.vsIndex : 0) -
@@ -4481,6 +4606,7 @@
         _cgptIndexInFlight = true;
         _cgptIndexStatus = 'loading';
         var seq = ++_cgptIndexRequestSeq;
+        var requestEpoch = _cgptRouteEpoch;
 
         function tokenPromise() {
             if (_cgptAccessToken && Date.now() - _cgptAccessTokenAt < 10 * 60 * 1000) {
@@ -4514,45 +4640,72 @@
                 });
             })
             .then(function (data) {
-                if (seq !== _cgptIndexRequestSeq || id !== _cgptConversationId()) return;
-                var questions = _cgptBuildQuestions(data);
+                if (seq !== _cgptIndexRequestSeq ||
+                    id !== _cgptConversationId() ||
+                    requestEpoch !== _cgptRouteEpoch) return;
+                var questions = _cgptBuildQuestions(data, id, requestEpoch);
                 if (!questions.length) throw new Error('conversation had no visible user prompts');
+                var messageKeys = _cgptActiveMessageKeySet(data);
                 _cgptIndexConversationId = id;
+                _cgptIndexRouteEpoch = requestEpoch;
                 _cgptIndexQuestions = questions;
+                _cgptIndexMessageKeys = messageKeys;
                 _cgptIndexStatus = 'ready';
                 _cgptIndexFailedAt = 0;
+                _cgptRouteTransition = false;
             })
             .catch(function (err) {
-                if (seq !== _cgptIndexRequestSeq) return;
+                if (seq !== _cgptIndexRequestSeq ||
+                    id !== _cgptConversationId() ||
+                    requestEpoch !== _cgptRouteEpoch) return;
                 _cgptIndexConversationId = id;
+                _cgptIndexRouteEpoch = requestEpoch;
                 _cgptIndexQuestions = [];
+                _cgptIndexMessageKeys = new Set();
                 _cgptIndexStatus = 'degraded';
                 _cgptIndexFailedAt = Date.now();
-                console.warn('[ACN ChatGPT] full-history index unavailable; using DOM harvest:', err);
+                console.warn('[ACN ChatGPT] full-history index unavailable; DOM is quarantined to prevent cross-conversation mixing:', err);
             })
             .then(function () {
-                if (seq !== _cgptIndexRequestSeq) return;
+                if (seq !== _cgptIndexRequestSeq || requestEpoch !== _cgptRouteEpoch) return;
                 _cgptIndexInFlight = false;
-                // Preserve generic virtual-scroll harvest on API failure; the ready
-                // branch ignores this flag and will replace it with the full index.
                 scanConversation(false);
             });
     }
 
+    function _cgptShellMatchesQuestion(shell, q) {
+        if (!shell || !q || !q.messageKey) return false;
+        var inner = shell.querySelector(
+            '[data-message-author-role="user"], [data-chatgpt-search-unit-key$=":user"]'
+        );
+        if (!inner) return false;
+        var text = _readMessageText(inner);
+        return _vsMessageKey(inner, text) === q.messageKey;
+    }
+
     function _cgptShellForQuestion(q) {
-        if (q && q.shell && q.shell.isConnected) return q.shell;
-        if (q && typeof q.vsIndex === 'number' && isFinite(q.vsIndex)) {
+        if (!_cgptQuestionBelongsToCurrent(q)) return null;
+
+        // A shell previously verified by message id during THIS route epoch remains a
+        // valid coarse scroll target even when virtualization later unmounts its body.
+        if (q.shell && q.shell.isConnected &&
+            q.shellVerifiedKey && q.shellVerifiedKey === q.messageKey) {
+            return q.shell;
+        }
+
+        if (typeof q.vsIndex === 'number' && isFinite(q.vsIndex)) {
             var byTestId = document.querySelector(
                 '[data-testid="conversation-turn-' + q.vsIndex + '"]'
             );
-            if (byTestId) return byTestId;
-        }
-        if (q && typeof q.userOrdinal === 'number') {
-            var shells = _cgptUserShells();
-            if (q.userOrdinal >= 0 && q.userOrdinal < shells.length) {
-                return shells[q.userOrdinal];
+            if (byTestId && _cgptShellMatchesQuestion(byTestId, q)) {
+                q.shell = byTestId;
+                q.shellVerifiedKey = q.messageKey;
+                return byTestId;
             }
         }
+
+        // Deliberately NO userOrdinal fallback. Equal row counts across A and B were
+        // enough to make that fallback return A's shell for a B question.
         return null;
     }
 
@@ -4591,16 +4744,49 @@
                 _cgptEnsureIndex(false);
                 if (_cgptIndexStatus === 'ready' &&
                     _cgptIndexConversationId === cgptId &&
+                    _cgptIndexRouteEpoch === _cgptRouteEpoch &&
                     _cgptIndexQuestions.length) {
                     _questions = _cgptBindMountedAndMerge(_cgptIndexQuestions);
-                    _aiResponses = Array.from(getAIMessages());
-                    if (typeof injectBookmarkIcons === 'function') injectBookmarkIcons();
+
+                    // Full mounted-window proof, across BOTH user and assistant ids.
+                    // A single unknown stable id means React is still showing another
+                    // conversation or a newer message not yet represented by the API.
+                    var domProof = _cgptMountedDomProof();
+                    if (domProof.verified) {
+                        _cgptDomVerifiedEpoch = _cgptRouteEpoch;
+                        _aiResponses = Array.from(getAIMessages());
+                        if (typeof injectBookmarkIcons === 'function') injectBookmarkIcons();
+                    } else {
+                        _cgptDomVerifiedEpoch = -1;
+                        _aiResponses = [];
+                        // If some current ids match and some are unknown, this can be
+                        // either a partially-recycled route transition or a newly sent /
+                        // streaming message. Refresh the API, but never merge the DOM.
+                        if (domProof.matched > 0 && domProof.unknown > 0) {
+                            _cgptScheduleRefresh();
+                        }
+                    }
+
                     if (typeof orbOnScanComplete === 'function') orbOnScanComplete();
                     return;
                 }
-            } else if (_cgptIndexConversationId) {
-                _cgptResetIndex();
+
+                // CRITICAL ISOLATION BARRIER:
+                // While B's API index is loading (or failed after a route switch), do
+                // not fall through to the generic virtual-scroll DOM harvester. The DOM
+                // may still be A and has no trustworthy conversation-id boundary.
+                _questions = [];
+                _aiResponses = [];
+                if (typeof orbOnScanComplete === 'function') orbOnScanComplete();
+                return;
             }
+
+            // Non-conversation ChatGPT routes are also a hard empty state.
+            if (_cgptIndexConversationId || _cgptIndexStatus !== 'idle') _cgptResetIndex();
+            _questions = [];
+            _aiResponses = [];
+            if (typeof orbOnScanComplete === 'function') orbOnScanComplete();
+            return;
         }
 
         // ── Claude: index-backed path ────────────────────────────
@@ -4836,6 +5022,11 @@
 
         var pushProxy = function () {
             _origPushState.apply(this, arguments);
+            if (platform.id === 'chatgpt') {
+                var changed = _cgptSyncRouteIdentity();
+                setTimeout(scanConversation, changed ? 0 : 250);
+                return;
+            }
             if (isVirtualScroll) _vsAccumulatedKeys.clear();
             _questions = [];
             resetTurnCounter();
@@ -4847,6 +5038,11 @@
 
         var replaceProxy = function () {
             _origReplaceState.apply(this, arguments);
+            if (platform.id === 'chatgpt') {
+                var changed = _cgptSyncRouteIdentity();
+                setTimeout(scanConversation, changed ? 0 : 250);
+                return;
+            }
             _questions = [];
             resetTurnCounter();
             if (platform.id === 'claude') setTimeout(_loadCachedSSEData, 600);
@@ -4867,6 +5063,11 @@
         }
 
         window.addEventListener('popstate', function () {
+            if (platform.id === 'chatgpt') {
+                var changed = _cgptSyncRouteIdentity();
+                setTimeout(scanConversation, changed ? 0 : 250);
+                return;
+            }
             if (isVirtualScroll) _vsAccumulatedKeys.clear();
             _questions = [];
             resetTurnCounter();
@@ -6475,9 +6676,27 @@
     // conversation. When the index is unavailable the user must be able to SEE
     // that the list is incomplete, not just find it in the console.
     function orbRenderIndexBanner(list) {
-        if (!ciIsClaudeChat()) return;
-
         var banner = null;
+
+        if (platform.id === 'chatgpt') {
+            if (_cgptIndexStatus === 'loading' || _cgptRouteTransition) {
+                banner = createElement('div', {
+                    className: 'acn-ci-banner acn-ci-loading',
+                    textContent: '… Loading this conversation'
+                });
+                banner.setAttribute('data-acn-index-status', 'loading');
+            } else if (_cgptIndexStatus === 'degraded') {
+                banner = createElement('div', {
+                    className: 'acn-ci-banner acn-ci-degraded',
+                    textContent: '⚠ Full conversation unavailable — stale DOM quarantined to avoid mixing chats'
+                });
+                banner.setAttribute('data-acn-index-status', 'degraded');
+            }
+            if (banner) list.appendChild(banner);
+            return;
+        }
+
+        if (!ciIsClaudeChat()) return;
 
         if (_ciStatus === 'degraded') {
             banner = createElement('div', {
@@ -6536,7 +6755,8 @@
         // early return fired and the "refresh failed — showing the last good snapshot" note
         // never appeared, including on reopening the panel (Codex).
         var fp = _questions.map(function (q) { return q.text.substring(0, 100); }).join('|') +
-                 '||' + _ciStatus + '|g' + _ciIndexGen + '|r' + (_ciRefreshFailed ? '1' : '0');
+                 '||' + _ciStatus + '|g' + _ciIndexGen + '|r' + (_ciRefreshFailed ? '1' : '0') +
+                 '|cg:' + _cgptIndexStatus + ':e' + _cgptRouteEpoch;
         if (fp === _navListFingerprint && list.firstChild) return;
         _navListFingerprint = fp;
 
@@ -7001,6 +7221,8 @@
     // matching on normalized text is the only durable handle we have until the
     // node carries a stable id.
     function _relocateQuestionElement(q) {
+        if (platform.id === 'chatgpt' && !_cgptQuestionBelongsToCurrent(q)) return null;
+
         // Index-backed disambiguation first. Matching on normalized text alone returns
         // the FIRST mounted match, so a repeated question — or two sharing a 200-char
         // prefix — resolves to the wrong one, and the caller then treats the question as
@@ -7046,6 +7268,12 @@
     var _chatgptJumpToken = 0;
 
     function _chatgptJumpToVirtualQuestion(q, done) {
+        if (!_cgptQuestionBelongsToCurrent(q)) {
+            done(false, null, 'superseded');
+            return;
+        }
+
+        var startEpoch = _cgptRouteEpoch;
         var scroller = platform && typeof platform.getScrollContainer === 'function'
             ? platform.getScrollContainer()
             : null;
@@ -7075,6 +7303,10 @@
 
         function tick() {
             if (token !== _chatgptJumpToken) return;
+            if (startEpoch !== _cgptRouteEpoch || !_cgptQuestionBelongsToCurrent(q)) {
+                finish(false, null, 'superseded');
+                return;
+            }
 
             var hit = _relocateQuestionElement(q);
             if (hit) {
@@ -7135,6 +7367,11 @@
     }
 
     function orbScrollToQuestion(q) {
+        if (platform.id === 'chatgpt' && !_cgptQuestionBelongsToCurrent(q)) {
+            showToast('Conversation changed — reopen the navigator');
+            return;
+        }
+
         ciPre('click q.pathIndex=' + q.pathIndex +
               ' provisional=' + (q.provisional ? 1 : 0) +
               ' claudeChat=' + (ciIsClaudeChat() ? 1 : 0) +
@@ -7148,9 +7385,9 @@
         // here and keep the plain behaviour — the seam stays clean for the
         // cross-platform audit to add platforms later.
         if (!target) {
-            // ChatGPT now virtualizes its conversation timeline. Unlike Claude we
-            // do not have an API-backed full tree here, but every harvested turn
-            // carries a stable conversation-turn-N ordinal, so page the virtualizer
+            // ChatGPT virtualizes its conversation timeline. The API-backed question
+            // carries a stable route owner plus an estimated/verified turn ordinal, so
+            // page the virtualizer
             // until that exact turn remounts.
             if (platform.id === 'chatgpt' && isVirtualScroll &&
                 typeof q.vsIndex === 'number' && isFinite(q.vsIndex)) {
@@ -7321,7 +7558,8 @@
                 }
             }
             var sfp = q + '|' + _questions.length + '|' + (_aiResponses ? _aiResponses.length : 0) +
-                      '|g' + _ciIndexGen + '|L' + liveLen;
+                      '|g' + _ciIndexGen + '|L' + liveLen +
+                      '|cg:' + _cgptIndexStatus + ':e' + _cgptRouteEpoch;
             if (sfp === _searchListFingerprint && list.firstChild) return;
             _searchListFingerprint = sfp;
         }
@@ -10162,7 +10400,11 @@
                               type: 'ai' });
             }
         } else {
-            aiMsgs = Array.from(getAIMessages()).map(function (el) {
+            var safeAiEls = (platform.id === 'chatgpt' &&
+                              _cgptDomVerifiedEpoch !== _cgptRouteEpoch)
+                ? []
+                : Array.from(getAIMessages());
+            aiMsgs = safeAiEls.map(function (el) {
                 return { element: el, text: _readAIText(el), type: 'ai' };
             });
         }
@@ -10867,6 +11109,9 @@
     function getConversationImages() {
         var allImages = [];
         if (typeof platform === 'undefined' || !platform) return allImages;
+        if (platform.id === 'chatgpt' && _cgptDomVerifiedEpoch !== _cgptRouteEpoch) {
+            return allImages;
+        }
 
         // imageSelector: null  → platform explicitly unsupported (e.g. Perplexity)
         // imageSelector: string → use as querySelectorAll argument within each message context
@@ -11465,6 +11710,11 @@
     }
 
     function exportFullConversation() {
+        if (platform.id === 'chatgpt' && _cgptDomVerifiedEpoch !== _cgptRouteEpoch) {
+            showToast('This conversation is still switching — export is temporarily unavailable');
+            return;
+        }
+
         try {
         // Prefer the complete index; fall back to the DOM scan, which on a
         // virtualized platform can only see what is mounted.
