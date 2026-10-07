@@ -155,9 +155,12 @@ function fail(msg, detail) {
 
   // SPA route switch regression: bypass ACN's patched history methods by using the
   // native pushState captured by the mock before the userscript was injected.
+  //
+  // IMPORTANT: intentionally leave conversation A's DOM mounted after the URL becomes B.
+  // This is the real ChatGPT transition hazard: route identity changes before React has
+  // necessarily torn down/recycled the previous conversation rows.
   await page.evaluate(secondId => {
     window.__probe.nativePushState({}, '', '/c/' + secondId);
-    window.__probe.switchConversation('Second conversation: ', 'msg-second-');
   }, SECOND_CONVO_ID);
 
   await page.waitForFunction(() => {
@@ -166,8 +169,8 @@ function fail(msg, detail) {
       (!panel || panel.getAttribute('data-acn-open') !== 'true');
   }, null, { timeout: 3000 });
 
-  // Reopen while B's full-history request is intentionally delayed. The old A index
-  // must already be gone; only B's mounted window may appear during this interval.
+  // Reopen immediately while A DOM is still visible and B's API request is delayed.
+  // Correct behaviour is an empty/loading B state — never A fallback.
   await page.click('[data-acn-role="nav-trigger"]');
   await page.waitForSelector('[data-acn-role="nav-panel"][data-acn-open="true"]', { timeout: 3000 });
 
@@ -175,17 +178,27 @@ function fail(msg, detail) {
     var items = Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'))
       .map(function(el){ return (el.textContent || '').trim(); });
     var stat = document.querySelector('[data-acn-role="nav-stat"]');
+    var banner = document.querySelector('[data-acn-index-status]');
     return {
       items,
       count: stat ? Number(stat.getAttribute('data-acn-count')) : null,
-      path: location.pathname
+      path: location.pathname,
+      banner: banner ? banner.getAttribute('data-acn-index-status') : null,
+      mounted: window.__probe.mounted()
     };
   });
 
   if (transition.items.some(t => /^Question number \d+ about virtual scrolling$/.test(t))) {
-    fail('old conversation A leaked into B during route transition', JSON.stringify(transition));
+    fail('old conversation A leaked into B while B was loading', JSON.stringify(transition));
+  }
+  if (!transition.mounted.some(t => /^Question number \d+ about virtual scrolling$/.test(t))) {
+    fail('fixture must still have A DOM mounted during the route transition', JSON.stringify(transition));
   }
 
+  // Wait for B's API index to become ready WITHOUT replacing A's DOM. The navigator
+  // must show exactly B's 24 API questions. Old code produced 28 (24 B + 4 mounted A),
+  // and positional shell alignment could bind all B questions to A shells when counts
+  // matched.
   await page.waitForFunction(total => {
     var stat = document.querySelector('[data-acn-role="nav-stat"]');
     var items = Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'));
@@ -196,10 +209,61 @@ function fail(msg, detail) {
       });
   }, TOTAL, { timeout: 10000 });
 
+  const apiReadyWhileOldDom = await page.evaluate(() => ({
+    count: Number(document.querySelector('[data-acn-role="nav-stat"]').getAttribute('data-acn-count')),
+    first: (document.querySelector('[data-acn-role="nav-item-text"]') || {}).textContent || '',
+    mounted: window.__probe.mounted(),
+    path: location.pathname
+  }));
+
+  if (apiReadyWhileOldDom.count !== TOTAL) {
+    fail('B API index must remain isolated from mounted A rows', JSON.stringify(apiReadyWhileOldDom));
+  }
+  if (!apiReadyWhileOldDom.mounted.some(t => /^Question number \d+ about virtual scrolling$/.test(t))) {
+    fail('A DOM should still be mounted when B API isolation is asserted', JSON.stringify(apiReadyWhileOldDom));
+  }
+
+  // A B nav click while only A DOM exists must NOT mark/accept an A row or shell.
+  await page.evaluate(() => {
+    var item = document.querySelector('[data-acn-role="nav-item"]');
+    if (item) item.click();
+  });
+  await page.waitForTimeout(3400);
+  const wrongJump = await page.evaluate(() => {
+    var el = document.querySelector('[data-acn-jump-target="true"]');
+    return el ? (el.textContent || '').trim() : null;
+  });
+  if (wrongJump && /^Question number \d+ about virtual scrolling$/.test(wrongJump)) {
+    fail('B question jump incorrectly accepted an A DOM target', wrongJump);
+  }
+
+  // Now let React "finish" the route by replacing mounted message bodies with B.
+  await page.evaluate(() => {
+    window.__probe.switchConversation('Second conversation: ', 'msg-second-');
+  });
+
+  await page.waitForFunction(() => {
+    var mounted = window.__probe.mounted();
+    return mounted.length === 4 &&
+      mounted.every(function(t){ return t.indexOf('Second conversation: ') === 0; });
+  }, null, { timeout: 5000 });
+
+  // Mutation-driven rebinding must keep the same isolated B membership.
+  await page.waitForFunction(total => {
+    var stat = document.querySelector('[data-acn-role="nav-stat"]');
+    var items = Array.from(document.querySelectorAll('[data-acn-role="nav-item-text"]'));
+    return stat && Number(stat.getAttribute('data-acn-count')) === total &&
+      items.length === total &&
+      items.every(function(el){
+        return (el.textContent || '').indexOf('Second conversation: Question number ') === 0;
+      });
+  }, TOTAL, { timeout: 5000 });
+
   const switched = await page.evaluate(() => ({
     count: Number(document.querySelector('[data-acn-role="nav-stat"]').getAttribute('data-acn-count')),
     first: (document.querySelector('[data-acn-role="nav-item-text"]') || {}).textContent || '',
-    path: location.pathname
+    path: location.pathname,
+    mounted: window.__probe.mounted()
   }));
 
   if (switched.count !== TOTAL) fail('conversation B should expose its own full API index', JSON.stringify(switched));
@@ -208,7 +272,7 @@ function fail(msg, detail) {
   }
 
   if (!process.exitCode) {
-    console.log('PASS: ChatGPT rollout + virtualized full-history navigator + SPA route reset');
+    console.log('PASS: ChatGPT virtualization + strict SPA conversation lifecycle isolation');
     console.log(JSON.stringify({ initial: result, transition, switched }));
   }
 
