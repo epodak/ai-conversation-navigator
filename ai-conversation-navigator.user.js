@@ -4311,9 +4311,17 @@
         // Initial page load has no outgoing conversation to confuse with.
         if (!_cgptRouteTransition || !_cgptOutgoingDomSignature) return true;
 
-        // SPA switch: only trust DOM after it demonstrably stops being the DOM snapshot
-        // from the conversation we just left.
-        return current !== _cgptOutgoingDomSignature;
+        if (current === _cgptOutgoingDomSignature) return false;
+
+        // A changed fingerprint can still mean a HALF-REPLACED React window (A+A+B).
+        // Require zero overlap with the outgoing mounted identities before trusting it.
+        var oldParts = _cgptOutgoingDomSignature.split('|').filter(Boolean);
+        var newParts = current.split('|').filter(Boolean);
+        var oldSet = new Set(oldParts);
+        for (var i = 0; i < newParts.length; i++) {
+            if (oldSet.has(newParts[i])) return false;
+        }
+        return true;
     }
 
     function _cgptScanSafeDomFallback(forceReset) {
