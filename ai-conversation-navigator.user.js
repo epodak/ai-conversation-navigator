@@ -3728,6 +3728,10 @@
     // DOM fallback is allowed when the API is unavailable, but only after the
     // mounted window is proven different from the conversation we just left.
     var _cgptOutgoingDomSignature = '';
+    // Last DOM snapshot known to belong to the currently observed route. This is
+    // captured continuously, not at navigation time, because a URL watcher can notice
+    // the route only after React has already started rendering the next conversation.
+    var _cgptLastRouteDomSignature = '';
     var _cgptDomFallbackActive = false;
     var _cgptAccessToken = null;
     var _cgptAccessTokenAt = 0;
@@ -4331,6 +4335,7 @@
         _cgptRouteTransition = false;
         _cgptDomFallbackActive = true;
         _cgptDomVerifiedEpoch = _cgptRouteEpoch;
+        _cgptLastRouteDomSignature = _cgptMountedDomSignature();
 
         var messages = Array.from(getUserMessages());
 
@@ -4443,14 +4448,18 @@
             _cgptRouteEpoch++;
             _cgptRouteTransition = false;
             _cgptOutgoingDomSignature = '';
+            _cgptLastRouteDomSignature = _cgptMountedDomSignature();
             return false;
         }
         if (nextKey === _cgptObservedRouteKey) return false;
 
         var prevKey = _cgptObservedRouteKey;
-        // Capture A before any cleanup. If the API for B fails, this snapshot lets us
-        // distinguish "A DOM is still hanging around" from "B DOM has now mounted".
-        _cgptOutgoingDomSignature = _cgptMountedDomSignature();
+        // Prefer the snapshot that was recorded while A was still the observed route.
+        // A watcher can notice the URL late, after B DOM already appeared, so sampling
+        // "right now" is only a fallback when no prior-route snapshot exists.
+        _cgptOutgoingDomSignature =
+            _cgptLastRouteDomSignature || _cgptMountedDomSignature();
+        _cgptLastRouteDomSignature = '';
 
         _cgptObservedRouteKey = nextKey;
         _cgptRouteEpoch++;
@@ -4883,6 +4892,7 @@
                     var domProof = _cgptMountedDomProof();
                     if (domProof.verified) {
                         _cgptDomVerifiedEpoch = _cgptRouteEpoch;
+                        _cgptLastRouteDomSignature = _cgptMountedDomSignature();
                         _aiResponses = Array.from(getAIMessages());
                         if (typeof injectBookmarkIcons === 'function') injectBookmarkIcons();
                     } else {
