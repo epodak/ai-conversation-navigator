@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI Conversation Navigator
 // @namespace    http://tampermonkey.net/
-// @version      12.14
+// @version      12.15
 // @description  Orbital navigation interface for AI chat platforms — Claude, ChatGPT, Grok, Gemini, Bolt, Lovable, Replit, V0, Base44, Emergent, Perplexity, and Firebase Studio
 // @updateURL    https://raw.githubusercontent.com/epodak/ai-conversation-navigator/main/ai-conversation-navigator.meta.js
 // @downloadURL  https://raw.githubusercontent.com/epodak/ai-conversation-navigator/main/ai-conversation-navigator.user.js
@@ -42,7 +42,7 @@
     // ============================================================
     // VERSION
     // ============================================================
-    var ACN_VERSION = '12.14';
+    var ACN_VERSION = '12.15';
 
     // ============================================================
     // i18n — internationalization string table
@@ -3725,6 +3725,10 @@
     // Set only after at least one mounted message id is proven to belong to the
     // current API snapshot. DOM-derived features are quarantined until then.
     var _cgptDomVerifiedEpoch = -1;
+    // DOM fallback is allowed when the API is unavailable, but only after the
+    // mounted window is proven different from the conversation we just left.
+    var _cgptOutgoingDomSignature = '';
+    var _cgptDomFallbackActive = false;
     var _cgptAccessToken = null;
     var _cgptAccessTokenAt = 0;
     var _navListFingerprint    = ''; // used to skip DOM rebuild when questions are unchanged
@@ -4271,6 +4275,114 @@
                q.routeEpoch === _cgptRouteEpoch;
     }
 
+    function _cgptMountedDomSignature() {
+        var parts = [];
+
+        function add(role, els) {
+            for (var i = 0; i < els.length; i++) {
+                var el = els[i];
+                var raw = platform.getMessageKey ? platform.getMessageKey(el) : null;
+                var text = role === 'u' ? _readMessageText(el) : _readAIText(el);
+                if (!raw && !text) continue;
+
+                // Prefer stable message identity. Text+virtual index is only a fallback
+                // for ChatGPT rollouts that temporarily omit message ids.
+                var key = raw
+                    ? raw
+                    : ('text:' + _normalizeFull(text).substring(0, 240) +
+                       ':v' + String(_vsMessageIndex(el, -1)));
+                parts.push(role + ':' + key);
+            }
+        }
+
+        add('u', Array.from(getUserMessages()));
+        add('a', Array.from(getAIMessages()));
+
+        parts.sort();
+        return parts.join('|');
+    }
+
+    function _cgptDomFallbackCanTakeOver() {
+        if (_cgptIndexStatus !== 'degraded') return false;
+
+        var current = _cgptMountedDomSignature();
+        if (!current) return false;
+
+        // Initial page load has no outgoing conversation to confuse with.
+        if (!_cgptRouteTransition || !_cgptOutgoingDomSignature) return true;
+
+        // SPA switch: only trust DOM after it demonstrably stops being the DOM snapshot
+        // from the conversation we just left.
+        return current !== _cgptOutgoingDomSignature;
+    }
+
+    function _cgptScanSafeDomFallback(forceReset) {
+        var currentId = _cgptConversationId();
+        if (!currentId || !_cgptDomFallbackCanTakeOver()) return false;
+
+        _cgptRouteTransition = false;
+        _cgptDomFallbackActive = true;
+        _cgptDomVerifiedEpoch = _cgptRouteEpoch;
+
+        var messages = Array.from(getUserMessages());
+
+        if (isVirtualScroll && !forceReset) {
+            var addedNew = false;
+            messages.forEach(function (msg) {
+                var text = _readMessageText(msg);
+                if (!text.trim()) return;
+                var key = _vsMessageKey(msg, text);
+                if (_vsAccumulatedKeys.has(key)) return;
+                _vsAccumulatedKeys.add(key);
+                _questions.push({
+                    element: msg,
+                    text: text,
+                    summary: generateSummary(text),
+                    vsIndex: _vsMessageIndex(msg, _questions.length),
+                    messageKey: key,
+                    conversationId: currentId,
+                    routeEpoch: _cgptRouteEpoch,
+                    apiBacked: false,
+                    domFallback: true
+                });
+                addedNew = true;
+            });
+            if (addedNew) {
+                _questions.sort(function (a, b) {
+                    return (a.vsIndex || 0) - (b.vsIndex || 0);
+                });
+            }
+        } else {
+            _vsAccumulatedKeys.clear();
+            _questions = [];
+            messages.forEach(function (msg) {
+                var text = _readMessageText(msg);
+                if (!text.trim()) return;
+                var key = _vsMessageKey(msg, text);
+                _vsAccumulatedKeys.add(key);
+                _questions.push({
+                    element: msg,
+                    text: text,
+                    summary: generateSummary(text),
+                    vsIndex: _vsMessageIndex(msg, _questions.length),
+                    messageKey: key,
+                    conversationId: currentId,
+                    routeEpoch: _cgptRouteEpoch,
+                    apiBacked: false,
+                    domFallback: true
+                });
+            });
+            _questions.sort(function (a, b) {
+                return (a.vsIndex || 0) - (b.vsIndex || 0);
+            });
+        }
+
+        _aiResponses = Array.from(getAIMessages());
+        if (typeof injectBookmarkIcons === 'function') injectBookmarkIcons();
+        if (typeof orbOnScanComplete === 'function') orbOnScanComplete();
+        return true;
+    }
+
     function _cgptClearConversationScopedState() {
         _cgptResetIndex();
         _vsAccumulatedKeys.clear();
@@ -4291,6 +4403,7 @@
         try { orbSetJumpBusy(false); } catch (e) {}
 
         _cgptDomVerifiedEpoch = -1;
+        _cgptDomFallbackActive = false;
 
         // Remove conversation-scoped UI state attached to DOM nodes that React may
         // keep alive/recycle across the route boundary.
@@ -4320,11 +4433,17 @@
         if (_cgptObservedRouteKey === null) {
             _cgptObservedRouteKey = nextKey;
             _cgptRouteEpoch++;
+            _cgptRouteTransition = false;
+            _cgptOutgoingDomSignature = '';
             return false;
         }
         if (nextKey === _cgptObservedRouteKey) return false;
 
         var prevKey = _cgptObservedRouteKey;
+        // Capture A before any cleanup. If the API for B fails, this snapshot lets us
+        // distinguish "A DOM is still hanging around" from "B DOM has now mounted".
+        _cgptOutgoingDomSignature = _cgptMountedDomSignature();
+
         _cgptObservedRouteKey = nextKey;
         _cgptRouteEpoch++;
         _cgptRouteTransition = !!_cgptConversationId();
@@ -4653,6 +4772,8 @@
                 _cgptIndexStatus = 'ready';
                 _cgptIndexFailedAt = 0;
                 _cgptRouteTransition = false;
+                _cgptDomFallbackActive = false;
+                _cgptOutgoingDomSignature = '';
             })
             .catch(function (err) {
                 if (seq !== _cgptIndexRequestSeq ||
@@ -4664,7 +4785,7 @@
                 _cgptIndexMessageKeys = new Set();
                 _cgptIndexStatus = 'degraded';
                 _cgptIndexFailedAt = Date.now();
-                console.warn('[ACN ChatGPT] full-history index unavailable; DOM is quarantined to prevent cross-conversation mixing:', err);
+                console.warn('[ACN ChatGPT] full-history index unavailable; waiting for a safe DOM fallback:', err);
             })
             .then(function () {
                 if (seq !== _cgptIndexRequestSeq || requestEpoch !== _cgptRouteEpoch) return;
@@ -4771,10 +4892,15 @@
                     return;
                 }
 
-                // CRITICAL ISOLATION BARRIER:
-                // While B's API index is loading (or failed after a route switch), do
-                // not fall through to the generic virtual-scroll DOM harvester. The DOM
-                // may still be A and has no trustworthy conversation-id boundary.
+                // Loading still quarantines DOM: immediately after A -> B the mounted
+                // window can still be A. On API failure, however, do NOT permanently
+                // brick the conversation. Once the mounted DOM is demonstrably different
+                // from the outgoing A snapshot, let B's own DOM take over in degraded mode.
+                if (_cgptIndexStatus === 'degraded' &&
+                    _cgptScanSafeDomFallback(!!forceReset)) {
+                    return;
+                }
+
                 _questions = [];
                 _aiResponses = [];
                 if (typeof orbOnScanComplete === 'function') orbOnScanComplete();
@@ -6688,9 +6814,14 @@
             } else if (_cgptIndexStatus === 'degraded') {
                 banner = createElement('div', {
                     className: 'acn-ci-banner acn-ci-degraded',
-                    textContent: '⚠ Full conversation unavailable — stale DOM quarantined to avoid mixing chats'
+                    textContent: _cgptDomFallbackActive
+                        ? '⚠ Full-history API unavailable — showing currently mounted messages'
+                        : '… Switching conversations — waiting for the new message window'
                 });
-                banner.setAttribute('data-acn-index-status', 'degraded');
+                banner.setAttribute(
+                    'data-acn-index-status',
+                    _cgptDomFallbackActive ? 'degraded-dom' : 'transition'
+                );
             }
             if (banner) list.appendChild(banner);
             return;
@@ -6779,7 +6910,9 @@
                     (_questions.length !== 1 ? 's' : '') +
                     (_cgptIndexStatus === 'ready'
                         ? ' indexed from full conversation'
-                        : ' indexed · scroll to discover older turns');
+                        : (_cgptDomFallbackActive
+                            ? ' visible · scroll to discover older turns'
+                            : ' loading this conversation'));
             } else {
                 stat.textContent = _questions.length + ' question' +
                     (_questions.length !== 1 ? 's' : '') + ' detected';
