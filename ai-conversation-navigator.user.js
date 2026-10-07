@@ -3706,6 +3706,10 @@
     var _cgptIndexRequestSeq = 0;
     var _cgptIndexFailedAt = 0;
     var _cgptRefreshTimer = null;
+    // Last ChatGPT route identity observed by ACN. ChatGPT is an SPA and can
+    // switch conversations without a document reload. The URL conversation id
+    // is the authoritative boundary for all conversation-scoped runtime state.
+    var _cgptObservedRouteKey = null;
     var _cgptAccessToken = null;
     var _cgptAccessTokenAt = 0;
     var _navListFingerprint    = ''; // used to skip DOM rebuild when questions are unchanged
@@ -4237,6 +4241,56 @@
         return m ? decodeURIComponent(m[1]) : null;
     }
 
+    function _cgptRouteKey() {
+        if (!platform || platform.id !== 'chatgpt') return null;
+        var id = _cgptConversationId();
+        // Query/hash changes are UI state inside the same conversation. Path changes
+        // are the actual state boundary; non-chat routes still need their own key so
+        // A -> home -> B cannot retain A's index while B is loading.
+        return id ? ('conversation:' + id) : ('path:' + location.pathname);
+    }
+
+    function _cgptSyncRouteIdentity() {
+        if (!platform || platform.id !== 'chatgpt') return false;
+
+        var nextKey = _cgptRouteKey();
+        if (_cgptObservedRouteKey === null) {
+            _cgptObservedRouteKey = nextKey;
+            return false;
+        }
+        if (nextKey === _cgptObservedRouteKey) return false;
+
+        _cgptObservedRouteKey = nextKey;
+
+        // Hard conversation boundary. Invalidate the API snapshot AND the generic
+        // virtual-scroll harvest before either can render on the new URL.
+        // _cgptResetIndex bumps the request generation, so a late response from the
+        // conversation we just left is ignored even if it completes afterwards.
+        _cgptResetIndex();
+        _vsAccumulatedKeys.clear();
+        _questions = [];
+        _aiResponses = [];
+
+        // These fingerprints skip DOM rebuilds when data appears unchanged. They are
+        // conversation-scoped identities, so carrying them across routes can preserve
+        // stale panel contents even after the underlying arrays were cleared.
+        _navListFingerprint = '';
+        _searchListFingerprint = '';
+        _bmListFingerprint = '';
+        _sumIndexStamp = null;
+        _sumComputeCache = null;
+
+        resetTurnCounter();
+
+        // Existing history hooks close the panel on push/pop. Do the same for route
+        // changes detected outside those hooks so no stale A panel remains visible
+        // while B's API index is loading.
+        if (typeof orbClosePanel === 'function') orbClosePanel();
+
+        console.log('[ACN ChatGPT] conversation route changed; cleared conversation-scoped state:', nextKey);
+        return true;
+    }
+
     function _cgptResetIndex() {
         _cgptIndexStatus = 'idle';
         _cgptIndexConversationId = null;
@@ -4526,6 +4580,10 @@
     }
 
     function scanConversation(forceReset) {
+        // URL identity is checked before ANY source can publish data. Mutation-driven
+        // scans therefore self-heal even when ChatGPT bypasses our history hooks.
+        _cgptSyncRouteIdentity();
+
         // ── ChatGPT: API-backed prompt index + live DOM binding ───────────
         if (platform.id === 'chatgpt') {
             var cgptId = _cgptConversationId();
@@ -4817,6 +4875,19 @@
             setTimeout(scanConversation, 500);
             if (isLeftChat) setTimeout(updateLeftChatPositions, 600);
         });
+
+        // Do not assume the host SPA must navigate through the history methods above.
+        // Modern routers can bypass a userscript's patched functions (or replace them
+        // after we patch). A tiny URL-identity watcher makes the route boundary
+        // transport-independent. It only does work when the ChatGPT conversation key
+        // actually changes; normal scans remain MutationObserver-driven.
+        if (platform.id === 'chatgpt') {
+            setInterval(function () {
+                if (_cgptSyncRouteIdentity()) {
+                    setTimeout(scanConversation, 0);
+                }
+            }, 250);
+        }
     }
 
     if (isLeftChat) {
